@@ -27,8 +27,7 @@ def build_data(n: int = 600, seed: int = 42) -> pd.DataFrame:
 
 if __name__ == "__main__":
     df = build_data()
-    config = GroupMLConfig(target="Target", experiment_modes=["full"], scorer="neg_mean_absolute_error")
+    config = GroupMLConfig(target="Target", experiment_modes=["full"], scorer="neg_root_mean_squared_error")
     result = GroupMLRunner(config).fit_evaluate(df)
     print(result.summary_text())
     print(result.leaderboard.head(5))
-

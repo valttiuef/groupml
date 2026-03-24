@@ -34,10 +34,9 @@ if __name__ == "__main__":
         target="Target",
         group_columns=["ActionGroup", "Material"],
         experiment_modes=["full", "group_as_features", "group_split", "group_permutations"],
-        scorer="neg_mean_absolute_error",
+        scorer="neg_root_mean_squared_error",
         random_state=42,
     )
     result = GroupMLRunner(config).fit_evaluate(df)
     print(result.recommendation)
     print(result.leaderboard.head(10))
-

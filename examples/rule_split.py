@@ -33,8 +33,7 @@ if __name__ == "__main__":
         target="Target",
         rule_splits=["Temperature < 20", "Temperature >= 20"],
         experiment_modes=["full", "rule_split"],
-        scorer="neg_mean_absolute_error",
+        scorer="neg_root_mean_squared_error",
     )
     result = GroupMLRunner(config).fit_evaluate(df)
     print(result.summary_text())
-

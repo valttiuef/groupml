@@ -8,7 +8,7 @@ from typing import Any, Callable, Iterable
 import numpy as np
 import pandas as pd
 from sklearn.base import clone
-from sklearn.metrics import get_scorer
+from sklearn.metrics import get_scorer, mean_squared_error
 from sklearn.pipeline import Pipeline
 
 from .config import GroupMLConfig
@@ -49,9 +49,6 @@ class GroupMLRunner:
         warnings: list[str] = []
         callback_list = list(callbacks or [])
         data = df.copy()
-        y = data[self.config.target]
-        task = infer_task(y, self.config.task)
-
         group_cols = list(self.config.group_columns)
         ensure_columns_exist(data, group_cols, "group")
 
@@ -61,16 +58,27 @@ class GroupMLRunner:
             feature_cols = list(self.config.feature_columns)
         ensure_columns_exist(data, feature_cols, "feature")
 
-        for col in group_cols:
-            if col not in feature_cols:
-                feature_cols.append(col)
-
         parsed_rules = [parse_rule(r) for r in self.config.rule_splits]
         ensure_columns_exist(data, [r.column for r in parsed_rules], "rule")
+        rule_columns = [r.column for r in parsed_rules]
 
-        X = data[feature_cols]
         cv_group_columns = list(self.config.cv_group_columns or [])
         ensure_columns_exist(data, cv_group_columns, "cv_group")
+
+        task = infer_task(data[self.config.target], self.config.task)
+        data, feature_cols, task = self._preprocess_base_dataset(
+            data=data,
+            feature_cols=feature_cols,
+            group_cols=group_cols,
+            rule_columns=rule_columns,
+            cv_group_columns=cv_group_columns,
+            task=task,
+            warnings=warnings,
+        )
+
+        y = data[self.config.target]
+
+        X = data[feature_cols]
         split_plan = plan_splits(
             X=X,
             y=y,
@@ -304,6 +312,78 @@ class GroupMLRunner:
             split_info=split_plan.split_info,
         )
 
+    def _preprocess_base_dataset(
+        self,
+        data: pd.DataFrame,
+        feature_cols: list[str],
+        group_cols: list[str],
+        rule_columns: list[str],
+        cv_group_columns: list[str],
+        task: str,
+        warnings: list[str],
+    ) -> tuple[pd.DataFrame, list[str], str]:
+        if task == "regression":
+            if (self.config.min_target is not None or self.config.max_target is not None) and not pd.api.types.is_numeric_dtype(
+                data[self.config.target]
+            ):
+                raise ValueError("min_target/max_target require a numeric regression target.")
+            if self.config.min_target is not None:
+                before = len(data)
+                data = data[data[self.config.target] >= self.config.min_target]
+                dropped = before - len(data)
+                if dropped:
+                    warnings.append(
+                        f"Base preprocessing dropped {dropped} rows below min_target={self.config.min_target}."
+                    )
+            if self.config.max_target is not None:
+                before = len(data)
+                data = data[data[self.config.target] <= self.config.max_target]
+                dropped = before - len(data)
+                if dropped:
+                    warnings.append(
+                        f"Base preprocessing dropped {dropped} rows above max_target={self.config.max_target}."
+                    )
+
+        if self.config.dropna_base_rows:
+            required_columns = sorted(
+                set(
+                    [self.config.target]
+                    + feature_cols
+                    + group_cols
+                    + rule_columns
+                    + cv_group_columns
+                )
+            )
+            before = len(data)
+            data = data.dropna(subset=required_columns)
+            dropped = before - len(data)
+            if dropped:
+                warnings.append(
+                    f"Base preprocessing dropped {dropped} rows containing NaNs in required columns."
+                )
+
+        protected = set(group_cols) | set(rule_columns) | set(cv_group_columns)
+        if self.config.drop_static_base_features:
+            static_features = [c for c in feature_cols if c not in protected and data[c].nunique(dropna=False) <= 1]
+            if static_features:
+                data = data.drop(columns=static_features)
+                feature_cols = [c for c in feature_cols if c not in static_features]
+                warnings.append(
+                    f"Base preprocessing removed {len(static_features)} static feature columns: {static_features}"
+                )
+
+        if not feature_cols:
+            raise ValueError("No feature columns left after base preprocessing.")
+        if data.empty:
+            raise ValueError("No rows left after base preprocessing.")
+
+        for col in group_cols:
+            if col not in feature_cols:
+                feature_cols.append(col)
+
+        task = infer_task(data[self.config.target], self.config.task)
+        return data, feature_cols, task
+
     def _emit_callbacks(
         self,
         callbacks: list[Callable[[dict[str, Any]], None]],
@@ -319,6 +399,12 @@ class GroupMLRunner:
 
     def _make_score_callable(self, scorer: str | Callable[..., float]) -> Callable[[Any, pd.DataFrame, pd.Series], float]:
         if isinstance(scorer, str):
+            if scorer.lower() == "rmse":
+                def _rmse_score(estimator: Any, X: pd.DataFrame, y: pd.Series) -> float:
+                    y_pred = estimator.predict(X)
+                    return float(-np.sqrt(mean_squared_error(y, y_pred)))
+
+                return _rmse_score
             scorer_obj = get_scorer(scorer)
 
             def _score(estimator: Any, X: pd.DataFrame, y: pd.Series) -> float:

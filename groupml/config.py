@@ -41,10 +41,14 @@ class GroupMLConfig:
     cv_group_columns: Sequence[str] | None = None
     test_splitter: Any = None
     include_split_indices: bool = True
-    scorer: str | Callable[..., float] = "neg_mean_absolute_error"
+    scorer: str | Callable[..., float] = "neg_root_mean_squared_error"
     test_size: float = 0.2
     random_state: int = 42
     scale_numeric: bool = False
+    dropna_base_rows: bool = True
+    drop_static_base_features: bool = True
+    min_target: float | None = None
+    max_target: float | None = None
     min_group_size: int = 15
     min_improvement: float = 0.01
     task: Literal["auto", "regression", "classification"] = "auto"
@@ -58,3 +62,6 @@ class GroupMLConfig:
             raise ValueError("cv must be an int or a splitter with .split.")
         if not isinstance(self.cv_params, dict):
             raise ValueError("cv_params must be a dictionary.")
+        if self.min_target is not None and self.max_target is not None:
+            if self.min_target > self.max_target:
+                raise ValueError("min_target must be <= max_target.")

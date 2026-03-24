@@ -38,9 +38,11 @@ config = GroupMLConfig(
     # cv="StratifiedGroupKFold",
     # cv_params={"n_splits": 5, "shuffle": True},
     # cv_group_columns=["ActionGroup"],
-    scorer="neg_mean_absolute_error",
+    scorer="neg_root_mean_squared_error",  # default (RMSE, sklearn "higher-is-better" via negative sign)
     test_size=0.2,
     random_state=42,
+    min_target=1,
+    max_target=99,
 )
 
 runner = GroupMLRunner(config)
@@ -135,8 +137,13 @@ python -m groupml --path examples/data/rule_split_demo.csv --target Target --rul
 - `test_splitter`: optional custom holdout splitter (name/object/callable/iterable)
 - `include_split_indices`: include row indices for holdout + CV folds in `result.split_info`
 - `scorer`: sklearn scorer string, scorer object, or callable
+- Default scorer is RMSE via `neg_root_mean_squared_error` (or use `"rmse"` alias)
 - `models`: `"default_fast"`, list of sklearn estimators, or dict of named estimators
 - `feature_selectors`: `"default_fast"`, selector name, list, or dict
+- Base preprocessing defaults:
+  - `dropna_base_rows=True` (drop rows with NaNs in required columns before splitting)
+  - `drop_static_base_features=True` (drop constant feature columns before splitting)
+  - Optional regression target filters: `min_target`, `max_target`
 
 ## Feature Selectors
 

@@ -49,13 +49,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Experiment modes to run. Defaults to all modes.",
     )
     parser.add_argument("--cv", type=int, default=5, help="Number of CV folds (default: 5).")
-    parser.add_argument("--scorer", default="neg_mean_absolute_error", help="sklearn scorer name.")
+    parser.add_argument(
+        "--scorer",
+        default="neg_root_mean_squared_error",
+        help="sklearn scorer name (or 'rmse' alias).",
+    )
     parser.add_argument("--task", choices=["auto", "regression", "classification"], default="auto")
     parser.add_argument("--test-size", type=float, default=0.2, help="Holdout test size fraction.")
     parser.add_argument("--random-state", type=int, default=42, help="Random seed.")
     parser.add_argument("--min-group-size", type=int, default=15)
     parser.add_argument("--min-improvement", type=float, default=0.01)
     parser.add_argument("--scale-numeric", action="store_true", help="Scale numeric features.")
+    parser.add_argument("--keep-nans", action="store_true", help="Disable base-row NaN dropping.")
+    parser.add_argument(
+        "--keep-static-features",
+        action="store_true",
+        help="Disable static feature-column removal in base preprocessing.",
+    )
+    parser.add_argument("--min-target", type=float, default=None, help="Optional min regression target filter.")
+    parser.add_argument("--max-target", type=float, default=None, help="Optional max regression target filter.")
     parser.add_argument("--sheet-name", default=None, help="Excel sheet name when using xls/xlsx.")
     parser.add_argument("--top", type=int, default=10, help="Leaderboard rows to print.")
     parser.add_argument(
@@ -90,6 +102,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         min_group_size=args.min_group_size,
         min_improvement=args.min_improvement,
         scale_numeric=args.scale_numeric,
+        dropna_base_rows=not args.keep_nans,
+        drop_static_base_features=not args.keep_static_features,
+        min_target=args.min_target,
+        max_target=args.max_target,
     )
 
     read_kwargs: dict[str, str] = {}

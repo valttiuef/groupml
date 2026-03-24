@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import operator
 import re
+import warnings
 from dataclasses import dataclass
 from itertools import combinations
 from typing import Any, Callable, Iterable, Sequence
@@ -71,6 +72,23 @@ class SafeSelectKBest(BaseEstimator, TransformerMixin):
         if self._selector is None:
             raise RuntimeError("SafeSelectKBest is not fitted.")
         return self._selector.transform(X)
+
+
+def stable_f_regression(X: Any, y: Any) -> tuple[np.ndarray, np.ndarray]:
+    """Run `f_regression` with a numeric-stability fallback for sparse high-offset data."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", RuntimeWarning)
+        scores = f_regression(X, y, center=True, force_finite=True)
+
+    saw_invalid_sqrt = any(
+        isinstance(item.message, RuntimeWarning)
+        and "invalid value encountered in sqrt" in str(item.message)
+        for item in caught
+    )
+    if saw_invalid_sqrt:
+        # Fallback avoids catastrophic cancellation in sparse norm computation.
+        return f_regression(X, y, center=False, force_finite=True)
+    return scores
 
 
 def parse_rule(rule: str) -> ParsedRule:
@@ -173,7 +191,7 @@ def build_selector(selector: Any, task: str, random_state: int) -> Any:
     if not isinstance(selector, str):
         return clone(selector)
     if selector == "kbest_f":
-        fn = f_classif if task == "classification" else f_regression
+        fn = f_classif if task == "classification" else stable_f_regression
         return SafeSelectKBest(score_func=fn, k=20)
     if selector == "kbest_mi":
         fn = mutual_info_classif if task == "classification" else mutual_info_regression
