@@ -21,11 +21,29 @@ from sklearn.ensemble import (
 )
 from sklearn.feature_selection import SelectFromModel, SelectKBest, f_classif, f_regression, mutual_info_classif, mutual_info_regression
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import ElasticNet, Lasso, LinearRegression, LogisticRegression, SGDClassifier, SGDRegressor
+from sklearn.linear_model import Lasso, LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from .config import GroupMLConfig
+from .models_classification import (
+    get_classification_model,
+    get_classification_models_by_strategy,
+    resolve_classification_model_name,
+)
+from .models_regression import (
+    get_regression_model,
+    get_regression_models_by_strategy,
+    resolve_regression_model_name,
+)
+from .selectors_classification import (
+    get_classification_selector_names_by_strategy,
+    resolve_classification_selector_name,
+)
+from .selectors_regression import (
+    get_regression_selector_names_by_strategy,
+    resolve_regression_selector_name,
+)
 
 OPS: dict[str, Callable[[Any, Any], Any]] = {
     "<": operator.lt,
@@ -123,65 +141,69 @@ def infer_task(y: pd.Series, requested: str) -> str:
 def normalize_models(models: Any, task: str, random_state: int) -> dict[str, BaseEstimator]:
     """Convert model config into a named dictionary of estimators."""
     if isinstance(models, str):
-        if models != "default_fast":
-            raise ValueError("Only 'default_fast' string preset is supported for models.")
         if task == "classification":
-            return {
-                "logistic_regression": LogisticRegression(max_iter=1000),
-                "sgd_classifier": SGDClassifier(
-                    loss="log_loss",
-                    penalty="elasticnet",
-                    l1_ratio=0.15,
-                    random_state=random_state,
-                ),
-                "extra_trees": ExtraTreesClassifier(
-                    n_estimators=200, random_state=random_state, n_jobs=-1
-                ),
-            }
-        return {
-            "linear_regression": LinearRegression(),
-            "elastic_net": ElasticNet(
-                alpha=0.001,
-                l1_ratio=0.5,
-                max_iter=5000,
-                random_state=random_state,
-            ),
-            "sgd_regressor": SGDRegressor(
-                penalty="elasticnet",
-                l1_ratio=0.15,
-                random_state=random_state,
-            ),
-            "extra_trees": ExtraTreesRegressor(
-                n_estimators=200, random_state=random_state, n_jobs=-1
-            ),
-        }
+            try:
+                return get_classification_models_by_strategy(models, random_state)
+            except ValueError:
+                model_name = resolve_classification_model_name(models)
+                model = get_classification_model(models, random_state)
+                return {model_name: model}
+        try:
+            return get_regression_models_by_strategy(models, random_state)
+        except ValueError:
+            model_name = resolve_regression_model_name(models)
+            model = get_regression_model(models, random_state)
+            return {model_name: model}
+
+    if isinstance(models, BaseEstimator):
+        return {models.__class__.__name__: models}
+
+    if callable(getattr(models, "fit", None)):
+        return {models.__class__.__name__: models}
+
     if isinstance(models, dict):
         return {name: est for name, est in models.items()}
-    if isinstance(models, Sequence):
+
+    if isinstance(models, Sequence) and not isinstance(models, (str, bytes)):
         out: dict[str, BaseEstimator] = {}
         for idx, est in enumerate(models):
             out[f"{est.__class__.__name__}_{idx}"] = est
         return out
-    raise ValueError("models must be 'default_fast', a sequence, or a dict.")
+
+    raise ValueError("models must be a model/strategy string, estimator, sequence, or dict.")
 
 
-def normalize_selectors(selectors: Any) -> dict[str, Any]:
+def normalize_selectors(selectors: Any, task: str) -> dict[str, Any]:
     """Convert feature selector config into a named dictionary."""
     if isinstance(selectors, str):
-        if selectors == "default_fast":
-            return {"kbest_f": "kbest_f", "extra_trees": "extra_trees"}
-        return {selectors: selectors}
+        if task == "classification":
+            try:
+                names = get_classification_selector_names_by_strategy(selectors)
+                return {name: name for name in names}
+            except ValueError:
+                name = resolve_classification_selector_name(selectors)
+                return {name: name}
+        try:
+            names = get_regression_selector_names_by_strategy(selectors)
+            return {name: name for name in names}
+        except ValueError:
+            name = resolve_regression_selector_name(selectors)
+            return {name: name}
     if isinstance(selectors, dict):
         return selectors
-    if isinstance(selectors, Sequence):
+    if isinstance(selectors, Sequence) and not isinstance(selectors, (str, bytes)):
         out: dict[str, Any] = {}
         for idx, sel in enumerate(selectors):
             if isinstance(sel, str):
-                out[sel] = sel
+                if task == "classification":
+                    name = resolve_classification_selector_name(sel)
+                else:
+                    name = resolve_regression_selector_name(sel)
+                out[name] = name
             else:
                 out[f"{sel.__class__.__name__}_{idx}"] = sel
         return out
-    raise ValueError("feature_selectors must be a preset string, sequence, or dict.")
+    raise ValueError("feature_selectors must be a selector/strategy string, sequence, or dict.")
 
 
 def build_selector(selector: Any, task: str, random_state: int) -> Any:

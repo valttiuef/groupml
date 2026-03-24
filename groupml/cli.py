@@ -25,29 +25,40 @@ def _parse_cv_value(raw: str) -> int | str:
 
 def _resolve_test_size(
     *,
-    test_size_pct: float,
-    test_size_rows: int | None,
-    legacy_test_size: float | None,
+    test_size: float,
+    test_size_strategy: str,
 ) -> tuple[float, int | None]:
-    if test_size_rows is not None:
-        if test_size_rows < 1:
-            raise ValueError("--test-size-rows must be >= 1.")
-        if legacy_test_size is not None:
-            raise ValueError("Use either --test-size-rows or --test-size, not both.")
-        return 0.15, int(test_size_rows)
+    size = float(test_size)
+    strategy = str(test_size_strategy).strip().lower()
 
-    if legacy_test_size is not None:
-        if not 0.0 < legacy_test_size < 1.0:
-            raise ValueError("--test-size must be a fraction in (0, 1).")
-        return float(legacy_test_size), None
+    if strategy == "rows":
+        if size < 1.0 or not size.is_integer():
+            raise ValueError("--test-size with strategy 'rows' must be an integer >= 1.")
+        return 0.15, int(size)
 
-    if not test_size_pct > 0.0:
-        raise ValueError("--test-size-pct must be > 0.")
-    if test_size_pct < 1.0:
-        return float(test_size_pct), None
-    if test_size_pct >= 100.0:
-        raise ValueError("--test-size-pct must be < 100.")
-    return float(test_size_pct) / 100.0, None
+    if strategy == "pct":
+        if size <= 0.0:
+            raise ValueError("--test-size with strategy 'pct' must be > 0.")
+        if size >= 100.0:
+            raise ValueError("--test-size with strategy 'pct' must be < 100.")
+        if size < 1.0:
+            return size, None
+        return size / 100.0, None
+
+    if strategy == "auto":
+        if size <= 0.0:
+            raise ValueError("--test-size with strategy 'auto' must be > 0.")
+        if size < 1.0:
+            return size, None
+        if size.is_integer():
+            return 0.15, int(size)
+        if size >= 100.0:
+            raise ValueError(
+                "--test-size with strategy 'auto' as percentage must be < 100 when using decimals >= 1."
+            )
+        return size / 100.0, None
+
+    raise ValueError("--test-size-strategy must be one of: auto, pct, rows.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -82,6 +93,18 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["full", "group_as_features", "group_split", "group_permutations", "rule_split"],
         default=None,
         help="Experiment modes to run. Defaults to all modes.",
+    )
+    parser.add_argument(
+        "--models",
+        default="default_fast",
+        help="Model name or model strategy (for example: default_fast, trees, all, ridge, extra_trees).",
+    )
+    parser.add_argument(
+        "--feature-selectors",
+        "--selectors",
+        dest="feature_selectors",
+        default="default_fast",
+        help="Feature selector name or strategy (for example: default_fast, linear_default, none, kbest_f).",
     )
     parser.add_argument(
         "--cv",
@@ -125,13 +148,20 @@ def build_parser() -> argparse.ArgumentParser:
         default="last_rows",
         help="Holdout strategy. 'last_rows' uses tail rows (date-ordered if split_date_column is set).",
     )
-    parser.add_argument("--test-size-pct", type=float, default=15.0, help="Holdout test size in percent (default 15).")
-    parser.add_argument("--test-size-rows", type=int, default=None, help="Holdout test size as absolute row count.")
+    parser.add_argument(
+        "--test-size-strategy",
+        choices=["auto", "pct", "rows"],
+        default="auto",
+        help=(
+            "How to interpret --test-size. "
+            "'auto' (default): <1 -> fraction, integer >=1 -> rows, decimal >=1 -> percent."
+        ),
+    )
     parser.add_argument(
         "--test-size",
         type=float,
-        default=None,
-        help="Legacy alias: holdout test size fraction in (0,1).",
+        default=0.15,
+        help="Holdout size value interpreted by --test-size-strategy.",
     )
     parser.add_argument("--random-state", type=int, default=42, help="Random seed.")
     parser.add_argument("--min-group-size", type=int, default=15)
@@ -166,9 +196,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         test_size, test_size_rows = _resolve_test_size(
-            test_size_pct=args.test_size_pct,
-            test_size_rows=args.test_size_rows,
-            legacy_test_size=args.test_size,
+            test_size=args.test_size,
+            test_size_strategy=args.test_size_strategy,
         )
     except ValueError as exc:
         parser.error(str(exc))
@@ -179,6 +208,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         group_columns=args.groups or [],
         rule_splits=args.rules or [],
         experiment_modes=args.modes or ["full", "group_as_features", "group_split", "group_permutations", "rule_split"],
+        models=args.models,
+        feature_selectors=args.feature_selectors,
         cv=_parse_cv_value(args.cv),
         split_group_column=args.split_group_column,
         split_date_column=args.split_date_column,

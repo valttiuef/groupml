@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from groupml.config import GroupMLConfig
 from groupml.result import GroupMLResult
@@ -69,6 +70,10 @@ def test_cli_main_parses_arguments(monkeypatch) -> None:
             "--modes",
             "full",
             "group_split",
+            "--models",
+            "trees",
+            "--feature-selectors",
+            "mutual_info",
             "--cv",
             "3",
             "--sheet-name",
@@ -84,6 +89,8 @@ def test_cli_main_parses_arguments(monkeypatch) -> None:
     assert cfg.group_columns == ["ActionGroup", "Material"]
     assert cfg.rule_splits == ["Temperature < 20", "Temperature >= 20"]
     assert cfg.experiment_modes == ["full", "group_split"]
+    assert cfg.models == "trees"
+    assert cfg.feature_selectors == "mutual_info"
     assert cfg.cv == 3
     assert cfg.test_split_strategy == "last_rows"
     assert cfg.test_size == 0.15
@@ -198,7 +205,9 @@ def test_cli_main_parses_test_size_rows(monkeypatch) -> None:
             "data.csv",
             "--target",
             "Target",
-            "--test-size-rows",
+            "--test-size-strategy",
+            "rows",
+            "--test-size",
             "12",
             "--test-split",
             "random",
@@ -210,6 +219,206 @@ def test_cli_main_parses_test_size_rows(monkeypatch) -> None:
     assert isinstance(cfg, GroupMLConfig)
     assert cfg.test_size_rows == 12
     assert cfg.test_split_strategy == "random"
+
+
+def test_cli_main_parses_test_size_auto_rows(monkeypatch) -> None:
+    from groupml import cli
+
+    captured: dict[str, object] = {}
+
+    def _fake_fit_evaluate_file(
+        path: str,
+        config: GroupMLConfig,
+        callbacks: object = None,
+        **read_kwargs: object,
+    ) -> GroupMLResult:
+        captured["path"] = path
+        captured["config"] = config
+        captured["callbacks"] = callbacks
+        captured["read_kwargs"] = read_kwargs
+        leaderboard = pd.DataFrame(
+            [
+                {
+                    "experiment_name": "full::linear::none",
+                    "mode": "full",
+                    "cv_mean": 0.9,
+                    "test_score": 0.8,
+                }
+            ]
+        )
+        return GroupMLResult(
+            leaderboard=leaderboard,
+            recommendation="Use full",
+            best_experiment=leaderboard.iloc[0].to_dict(),
+            baseline_experiment=leaderboard.iloc[0].to_dict(),
+        )
+
+    monkeypatch.setattr(cli, "fit_evaluate_file", _fake_fit_evaluate_file)
+    monkeypatch.setattr(cli, "export_summary", lambda result, path, top_n=10, sheet_name="summary": Path(path))
+    monkeypatch.setattr(cli, "default_summary_filename", lambda ext=".csv": f"default_name{ext}")
+
+    exit_code = cli.main(
+        [
+            "--path",
+            "data.csv",
+            "--target",
+            "Target",
+            "--test-size",
+            "36",
+        ]
+    )
+
+    assert exit_code == 0
+    cfg = captured["config"]
+    assert isinstance(cfg, GroupMLConfig)
+    assert cfg.test_size_rows == 36
+    assert cfg.test_size == 0.15
+
+
+def test_cli_main_parses_test_size_pct_with_integer_percent(monkeypatch) -> None:
+    from groupml import cli
+
+    captured: dict[str, object] = {}
+
+    def _fake_fit_evaluate_file(
+        path: str,
+        config: GroupMLConfig,
+        callbacks: object = None,
+        **read_kwargs: object,
+    ) -> GroupMLResult:
+        captured["path"] = path
+        captured["config"] = config
+        captured["callbacks"] = callbacks
+        captured["read_kwargs"] = read_kwargs
+        leaderboard = pd.DataFrame(
+            [
+                {
+                    "experiment_name": "full::linear::none",
+                    "mode": "full",
+                    "cv_mean": 0.9,
+                    "test_score": 0.8,
+                }
+            ]
+        )
+        return GroupMLResult(
+            leaderboard=leaderboard,
+            recommendation="Use full",
+            best_experiment=leaderboard.iloc[0].to_dict(),
+            baseline_experiment=leaderboard.iloc[0].to_dict(),
+        )
+
+    monkeypatch.setattr(cli, "fit_evaluate_file", _fake_fit_evaluate_file)
+    monkeypatch.setattr(cli, "export_summary", lambda result, path, top_n=10, sheet_name="summary": Path(path))
+    monkeypatch.setattr(cli, "default_summary_filename", lambda ext=".csv": f"default_name{ext}")
+
+    exit_code = cli.main(
+        [
+            "--path",
+            "data.csv",
+            "--target",
+            "Target",
+            "--test-size-strategy",
+            "pct",
+            "--test-size",
+            "37",
+        ]
+    )
+
+    assert exit_code == 0
+    cfg = captured["config"]
+    assert isinstance(cfg, GroupMLConfig)
+    assert cfg.test_size_rows is None
+    assert cfg.test_size == 0.37
+
+
+def test_cli_main_parses_test_size_auto_decimal_percent(monkeypatch) -> None:
+    from groupml import cli
+
+    captured: dict[str, object] = {}
+
+    def _fake_fit_evaluate_file(
+        path: str,
+        config: GroupMLConfig,
+        callbacks: object = None,
+        **read_kwargs: object,
+    ) -> GroupMLResult:
+        captured["path"] = path
+        captured["config"] = config
+        captured["callbacks"] = callbacks
+        captured["read_kwargs"] = read_kwargs
+        leaderboard = pd.DataFrame(
+            [
+                {
+                    "experiment_name": "full::linear::none",
+                    "mode": "full",
+                    "cv_mean": 0.9,
+                    "test_score": 0.8,
+                }
+            ]
+        )
+        return GroupMLResult(
+            leaderboard=leaderboard,
+            recommendation="Use full",
+            best_experiment=leaderboard.iloc[0].to_dict(),
+            baseline_experiment=leaderboard.iloc[0].to_dict(),
+        )
+
+    monkeypatch.setattr(cli, "fit_evaluate_file", _fake_fit_evaluate_file)
+    monkeypatch.setattr(cli, "export_summary", lambda result, path, top_n=10, sheet_name="summary": Path(path))
+    monkeypatch.setattr(cli, "default_summary_filename", lambda ext=".csv": f"default_name{ext}")
+
+    exit_code = cli.main(
+        [
+            "--path",
+            "data.csv",
+            "--target",
+            "Target",
+            "--test-size",
+            "64.2",
+        ]
+    )
+
+    assert exit_code == 0
+    cfg = captured["config"]
+    assert isinstance(cfg, GroupMLConfig)
+    assert cfg.test_size_rows is None
+    assert cfg.test_size == 0.642
+
+
+def test_cli_main_rejects_invalid_manual_test_size(monkeypatch) -> None:
+    from groupml import cli
+
+    monkeypatch.setattr(cli, "fit_evaluate_file", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "export_summary", lambda result, path, top_n=10, sheet_name="summary": Path(path))
+    monkeypatch.setattr(cli, "default_summary_filename", lambda ext=".csv": f"default_name{ext}")
+
+    with pytest.raises(SystemExit):
+        cli.main(
+            [
+                "--path",
+                "data.csv",
+                "--target",
+                "Target",
+                "--test-size-strategy",
+                "pct",
+                "--test-size",
+                "200",
+            ]
+        )
+
+    with pytest.raises(SystemExit):
+        cli.main(
+            [
+                "--path",
+                "data.csv",
+                "--target",
+                "Target",
+                "--test-size-strategy",
+                "rows",
+                "--test-size",
+                "123.546",
+            ]
+        )
 
 
 def test_cli_main_writes_output_file(monkeypatch, tmp_path: Path) -> None:

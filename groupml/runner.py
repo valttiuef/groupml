@@ -112,7 +112,7 @@ class GroupMLRunner:
         y_train, y_test = y.iloc[split_plan.train_indices], y.iloc[split_plan.test_indices]
 
         models = normalize_models(self.config.models, task, self.config.random_state)
-        selectors = normalize_selectors(self.config.feature_selectors)
+        selectors = normalize_selectors(self.config.feature_selectors, task)
         model_selector_runs = len(models) * len(selectors)
         group_permutation_splits = group_column_permutations(group_cols) if group_cols else []
         planned_variants = {
