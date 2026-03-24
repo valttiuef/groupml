@@ -21,6 +21,21 @@ def _sample_df(n: int = 120, seed: int = 21) -> pd.DataFrame:
     return df
 
 
+def _sample_df_with_split_columns(n: int = 120, seed: int = 31) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    df = pd.DataFrame(
+        {
+            "x1": rng.normal(0, 1, n),
+            "x2": rng.normal(0, 1, n),
+            "ActionGroup": rng.choice(["A", "B", "C", "D"], size=n),
+            "BatchDate": pd.date_range("2024-01-01", periods=n, freq="D"),
+            "Strata": rng.choice(["low", "mid", "high"], size=n),
+        }
+    )
+    df["Target"] = 1.1 * df["x1"] - 0.4 * df["x2"] + np.where(df["Strata"] == "high", 0.7, 0.0)
+    return df
+
+
 def test_plan_splits_supports_groupkfold_by_name() -> None:
     df = _sample_df()
     X = df[["x1", "x2", "ActionGroup"]]
@@ -68,3 +83,111 @@ def test_runner_accepts_custom_cv_callable() -> None:
     assert result.split_info["cv"]["n_splits"] == 2
     assert result.split_info["cv"]["splitter"] == "CallableSplitter"
     assert result.split_info["test"]["splitter"] == "train_test_split"
+
+
+def test_plan_splits_infers_groupcv_from_group_column() -> None:
+    df = _sample_df_with_split_columns()
+    X = df[["x1", "x2"]]
+    y = df["Target"]
+    split_plan = plan_splits(
+        X=X,
+        y=y,
+        task="regression",
+        cv=4,
+        random_state=42,
+        test_size=0.2,
+        cv_group_columns=["ActionGroup"],
+        cv_source_df=df,
+    )
+
+    assert split_plan.cv_splitter_name == "GroupKFold"
+    assert split_plan.split_info["cv"]["strategy_requested"] == "groupcv"
+    assert split_plan.split_info["cv"]["strategy_used"] == "groupcv"
+    assert split_plan.split_info["cv"]["inferred_from_columns"] is True
+
+
+def test_plan_splits_prefers_timecv_over_groupcv_when_both_columns_provided() -> None:
+    df = _sample_df_with_split_columns()
+    X = df[["x1", "x2"]]
+    y = df["Target"]
+    split_plan = plan_splits(
+        X=X,
+        y=y,
+        task="regression",
+        cv=4,
+        random_state=42,
+        test_size=0.2,
+        cv_group_columns=["ActionGroup"],
+        cv_date_column="BatchDate",
+        cv_source_df=df,
+    )
+
+    assert split_plan.cv_splitter_name == "DateTimeSeriesSplitter"
+    assert split_plan.split_info["cv"]["strategy_requested"] == "timecv"
+    assert split_plan.split_info["cv"]["strategy_used"] == "timecv"
+
+
+def test_plan_splits_infers_stratifycv_from_stratify_column() -> None:
+    df = _sample_df_with_split_columns()
+    X = df[["x1", "x2"]]
+    y = df["Target"]
+    split_plan = plan_splits(
+        X=X,
+        y=y,
+        task="regression",
+        cv=4,
+        random_state=42,
+        test_size=0.2,
+        cv_stratify_column="Strata",
+        cv_source_df=df,
+    )
+
+    assert split_plan.cv_splitter_name == "StratifiedKFold"
+    assert split_plan.split_info["cv"]["strategy_requested"] == "stratifycv"
+    assert split_plan.split_info["cv"]["strategy_used"] == "stratifycv"
+
+
+def test_plan_splits_stratifygroupcv_falls_back_to_groupcv() -> None:
+    df = _sample_df_with_split_columns()
+    X = df[["x1", "x2"]]
+    y = df["Target"]
+    split_plan = plan_splits(
+        X=X,
+        y=y,
+        task="regression",
+        cv="stratifygroupcv",
+        cv_params={"n_splits": 4},
+        random_state=42,
+        test_size=0.2,
+        cv_group_columns=["ActionGroup"],
+        cv_stratify_column="Strata",
+        cv_source_df=df,
+    )
+
+    assert split_plan.split_info["cv"]["strategy_requested"] == "stratifygroupcv"
+    assert split_plan.split_info["cv"]["strategy_used"] == "groupcv"
+    assert split_plan.split_info["cv"]["fallback_applied"] is True
+    assert len(split_plan.warnings) >= 1
+
+
+def test_plan_splits_stratifytimecv_falls_back_to_timecv() -> None:
+    df = _sample_df_with_split_columns()
+    X = df[["x1", "x2"]]
+    y = df["Target"]
+    split_plan = plan_splits(
+        X=X,
+        y=y,
+        task="regression",
+        cv="stratifytimecv",
+        cv_params={"n_splits": 4},
+        random_state=42,
+        test_size=0.2,
+        cv_date_column="BatchDate",
+        cv_stratify_column="Strata",
+        cv_source_df=df,
+    )
+
+    assert split_plan.split_info["cv"]["strategy_requested"] == "stratifytimecv"
+    assert split_plan.split_info["cv"]["strategy_used"] == "timecv"
+    assert split_plan.split_info["cv"]["fallback_applied"] is True
+    assert len(split_plan.warnings) >= 1

@@ -38,7 +38,10 @@ class GroupMLConfig:
     feature_selectors: str | Sequence[Any] | dict[str, Any] = "default_fast"
     cv: int | str | dict[str, Any] | Any = 5
     cv_params: dict[str, Any] = field(default_factory=dict)
+    cv_group_column: str | None = None
     cv_group_columns: Sequence[str] | None = None
+    cv_date_column: str | None = None
+    cv_stratify_column: str | None = None
     test_splitter: Any = None
     include_split_indices: bool = True
     scorer: str | Callable[..., float] = "neg_root_mean_squared_error"
@@ -62,6 +65,17 @@ class GroupMLConfig:
             raise ValueError("cv must be an int or a splitter with .split.")
         if not isinstance(self.cv_params, dict):
             raise ValueError("cv_params must be a dictionary.")
+        if self.cv_group_column is not None and not isinstance(self.cv_group_column, str):
+            raise ValueError("cv_group_column must be a string column name or None.")
+        if self.cv_group_columns is not None:
+            if isinstance(self.cv_group_columns, str):
+                self.cv_group_columns = [self.cv_group_columns]
+            else:
+                self.cv_group_columns = list(self.cv_group_columns)
+        if self.cv_date_column is not None and not isinstance(self.cv_date_column, str):
+            raise ValueError("cv_date_column must be a string column name or None.")
+        if self.cv_stratify_column is not None and not isinstance(self.cv_stratify_column, str):
+            raise ValueError("cv_stratify_column must be a string column name or None.")
         if self.min_target is not None and self.max_target is not None:
             if self.min_target > self.max_target:
                 raise ValueError("min_target must be <= max_target.")

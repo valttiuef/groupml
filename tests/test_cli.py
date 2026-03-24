@@ -91,6 +91,68 @@ def test_cli_main_parses_arguments(monkeypatch) -> None:
     assert captured["summary_export_path"] == Path.cwd() / "default_name.csv"
 
 
+def test_cli_main_parses_cv_columns(monkeypatch) -> None:
+    from groupml import cli
+
+    captured: dict[str, object] = {}
+
+    def _fake_fit_evaluate_file(
+        path: str,
+        config: GroupMLConfig,
+        callbacks: object = None,
+        **read_kwargs: object,
+    ) -> GroupMLResult:
+        captured["path"] = path
+        captured["config"] = config
+        captured["callbacks"] = callbacks
+        captured["read_kwargs"] = read_kwargs
+        leaderboard = pd.DataFrame(
+            [
+                {
+                    "experiment_name": "full::linear::none",
+                    "mode": "full",
+                    "cv_mean": 0.9,
+                    "test_score": 0.8,
+                }
+            ]
+        )
+        return GroupMLResult(
+            leaderboard=leaderboard,
+            recommendation="Use full",
+            best_experiment=leaderboard.iloc[0].to_dict(),
+            baseline_experiment=leaderboard.iloc[0].to_dict(),
+        )
+
+    monkeypatch.setattr(cli, "fit_evaluate_file", _fake_fit_evaluate_file)
+    monkeypatch.setattr(cli, "export_summary", lambda result, path, top_n=10, sheet_name="summary": Path(path))
+    monkeypatch.setattr(cli, "default_summary_filename", lambda ext=".csv": f"default_name{ext}")
+
+    exit_code = cli.main(
+        [
+            "--path",
+            "data.csv",
+            "--target",
+            "Target",
+            "--cv",
+            "stratifytimecv",
+            "--cv-group-column",
+            "ActionGroup",
+            "--cv-date-column",
+            "BatchDate",
+            "--cv-stratify-column",
+            "Shift",
+        ]
+    )
+
+    assert exit_code == 0
+    cfg = captured["config"]
+    assert isinstance(cfg, GroupMLConfig)
+    assert cfg.cv == "stratifytimecv"
+    assert cfg.cv_group_column == "ActionGroup"
+    assert cfg.cv_date_column == "BatchDate"
+    assert cfg.cv_stratify_column == "Shift"
+
+
 def test_cli_main_writes_output_file(monkeypatch, tmp_path: Path) -> None:
     from groupml import cli
 
@@ -153,3 +215,129 @@ def test_cli_main_writes_output_file(monkeypatch, tmp_path: Path) -> None:
     assert out_csv.exists()
     written = pd.read_csv(out_csv)
     assert "section" in written.columns
+
+
+def test_cli_progress_callback_prints_cv_and_test_scores(monkeypatch, capsys) -> None:
+    from groupml import cli
+
+    def _fake_fit_evaluate_file(
+        path: str,
+        config: GroupMLConfig,
+        callbacks: object = None,
+        **read_kwargs: object,
+    ) -> GroupMLResult:
+        del path, config, read_kwargs
+        assert isinstance(callbacks, list)
+        callback = callbacks[0]
+        callback(
+            {
+                "event": "run_started",
+                "total_experiments": 1,
+                "cv_splitter": "KFold",
+                "cv_strategy_used": "kfold",
+                "cv_n_splits": 3,
+            }
+        )
+        callback(
+            {
+                "event": "experiment_completed",
+                "completed_experiments": 1,
+                "total_experiments": 1,
+                "mode": "full",
+                "model": "linear",
+                "selector": "none",
+                "cv_mean": 0.9,
+                "test_score": 0.8,
+            }
+        )
+        leaderboard = pd.DataFrame(
+            [
+                {
+                    "experiment_name": "full::linear::none",
+                    "mode": "full",
+                    "cv_mean": 0.9,
+                    "test_score": 0.8,
+                }
+            ]
+        )
+        return GroupMLResult(
+            leaderboard=leaderboard,
+            recommendation="Use full",
+            best_experiment=leaderboard.iloc[0].to_dict(),
+            baseline_experiment=leaderboard.iloc[0].to_dict(),
+        )
+
+    monkeypatch.setattr(cli, "fit_evaluate_file", _fake_fit_evaluate_file)
+    monkeypatch.setattr(cli, "export_summary", lambda result, path, top_n=10, sheet_name="summary": Path(path))
+    monkeypatch.setattr(cli, "default_summary_filename", lambda ext=".csv": f"default_name{ext}")
+
+    exit_code = cli.main(["--path", "data.csv", "--target", "Target", "--scorer", "r2"])
+
+    assert exit_code == 0
+    stdout = capsys.readouterr().out
+    assert "cv_score=0.90000" in stdout
+    assert "test_score=0.80000" in stdout
+
+
+def test_cli_progress_callback_prints_positive_rmse(monkeypatch, capsys) -> None:
+    from groupml import cli
+
+    def _fake_fit_evaluate_file(
+        path: str,
+        config: GroupMLConfig,
+        callbacks: object = None,
+        **read_kwargs: object,
+    ) -> GroupMLResult:
+        del path, config, read_kwargs
+        assert isinstance(callbacks, list)
+        callback = callbacks[0]
+        callback(
+            {
+                "event": "run_started",
+                "total_experiments": 1,
+                "cv_splitter": "KFold",
+                "cv_strategy_used": "kfold",
+                "cv_n_splits": 3,
+            }
+        )
+        callback(
+            {
+                "event": "experiment_completed",
+                "completed_experiments": 1,
+                "total_experiments": 1,
+                "mode": "full",
+                "model": "linear",
+                "selector": "none",
+                "cv_mean": -1.23456,
+                "test_score": -2.34567,
+            }
+        )
+        leaderboard = pd.DataFrame(
+            [
+                {
+                    "experiment_name": "full::linear::none",
+                    "mode": "full",
+                    "cv_mean": -1.23456,
+                    "test_score": -2.34567,
+                }
+            ]
+        )
+        return GroupMLResult(
+            leaderboard=leaderboard,
+            recommendation="Use full",
+            best_experiment=leaderboard.iloc[0].to_dict(),
+            baseline_experiment=leaderboard.iloc[0].to_dict(),
+        )
+
+    monkeypatch.setattr(cli, "fit_evaluate_file", _fake_fit_evaluate_file)
+    monkeypatch.setattr(cli, "export_summary", lambda result, path, top_n=10, sheet_name="summary": Path(path))
+    monkeypatch.setattr(cli, "default_summary_filename", lambda ext=".csv": f"default_name{ext}")
+
+    exit_code = cli.main(
+        ["--path", "data.csv", "--target", "Target", "--scorer", "neg_root_mean_squared_error"]
+    )
+
+    assert exit_code == 0
+    stdout = capsys.readouterr().out
+    assert "cv_rmse=1.23456" in stdout
+    assert "test_rmse=2.34567" in stdout

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 from typing import Sequence
 
@@ -13,6 +14,13 @@ from .file_utils import (
     export_summary,
     fit_evaluate_file,
 )
+
+
+def _parse_cv_value(raw: str) -> int | str:
+    value = str(raw).strip()
+    if value.isdigit():
+        return int(value)
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,7 +56,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Experiment modes to run. Defaults to all modes.",
     )
-    parser.add_argument("--cv", type=int, default=5, help="Number of CV folds (default: 5).")
+    parser.add_argument(
+        "--cv",
+        type=str,
+        default="5",
+        help=(
+            "CV setting: fold count (for example 5) or splitter name "
+            "(for example groupcv, timecv, stratifycv, stratifygroupcv, stratifytimecv)."
+        ),
+    )
+    parser.add_argument("--cv-group-column", default=None, help="Single group column used for CV grouping.")
+    parser.add_argument("--cv-date-column", default=None, help="Datetime column used for time-based CV.")
+    parser.add_argument(
+        "--cv-stratify-column",
+        default=None,
+        help="Column used for stratified CV behavior.",
+    )
     parser.add_argument(
         "--scorer",
         default="neg_root_mean_squared_error",
@@ -94,7 +117,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         group_columns=args.groups or [],
         rule_splits=args.rules or [],
         experiment_modes=args.modes or ["full", "group_as_features", "group_split", "group_permutations", "rule_split"],
-        cv=args.cv,
+        cv=_parse_cv_value(args.cv),
+        cv_group_column=args.cv_group_column,
+        cv_date_column=args.cv_date_column,
+        cv_stratify_column=args.cv_stratify_column,
         scorer=args.scorer,
         task=args.task,
         test_size=args.test_size,
@@ -112,11 +138,37 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.sheet_name is not None:
         read_kwargs["sheet_name"] = args.sheet_name
 
+    scorer_name = str(args.scorer).strip().lower()
+    rmse_display = scorer_name in {"rmse", "neg_root_mean_squared_error"}
+
+    def _format_score(value: object, positive_rmse: bool = False) -> str:
+        if value is None:
+            return "nan"
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return "nan"
+        if not math.isfinite(parsed):
+            return "nan"
+        if positive_rmse:
+            parsed = abs(parsed)
+        return f"{parsed:.5f}"
+
     def _cli_progress_callback(event: dict[str, object]) -> None:
         event_name = event.get("event")
         if event_name == "run_started":
             total = int(event.get("total_experiments", 0))
-            print(f"[groupml] Running {total} experiment(s)...")
+            splitter = event.get("cv_splitter", "unknown")
+            strategy = event.get("cv_strategy_used", "unknown")
+            folds = int(event.get("cv_n_splits", 0))
+            inferred = " [inferred]" if bool(event.get("cv_inferred_from_columns")) else ""
+            print(
+                f"[groupml] Running {total} experiment(s) | cv={splitter} "
+                f"(strategy={strategy}, folds={folds}){inferred}"
+            )
+            if bool(event.get("cv_fallback_applied")):
+                reason = event.get("cv_fallback_reason", "constraint mismatch")
+                print(f"[groupml] CV hybrid fallback applied ({reason}); check warnings in final summary.")
             return
         if event_name == "mode_started":
             mode = event.get("mode", "unknown")
@@ -129,7 +181,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             mode = event.get("mode", "unknown")
             model = event.get("model", "unknown")
             selector = event.get("selector", "unknown")
-            print(f"[groupml] [{done}/{total}] {mode} | model={model} | selector={selector}")
+            cv_mean = _format_score(event.get("cv_mean"), positive_rmse=rmse_display)
+            test_score = _format_score(event.get("test_score"), positive_rmse=rmse_display)
+            if rmse_display:
+                print(
+                    f"[groupml] [{done}/{total}] {mode} | model={model} | selector={selector} "
+                    f"| cv_rmse={cv_mean} | test_rmse={test_score}"
+                )
+            else:
+                print(
+                    f"[groupml] [{done}/{total}] {mode} | model={model} | selector={selector} "
+                    f"| cv_score={cv_mean} | test_score={test_score}"
+                )
 
     result = fit_evaluate_file(args.path, config, callbacks=[_cli_progress_callback], **read_kwargs)
 
