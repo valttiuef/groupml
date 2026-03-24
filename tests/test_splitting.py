@@ -82,7 +82,7 @@ def test_runner_accepts_custom_cv_callable() -> None:
     assert not result.leaderboard.empty
     assert result.split_info["cv"]["n_splits"] == 2
     assert result.split_info["cv"]["splitter"] == "CallableSplitter"
-    assert result.split_info["test"]["splitter"] == "train_test_split"
+    assert result.split_info["test"]["splitter"] == "last_rows"
 
 
 def test_plan_splits_infers_groupcv_from_group_column() -> None:
@@ -117,8 +117,8 @@ def test_plan_splits_prefers_timecv_over_groupcv_when_both_columns_provided() ->
         cv=4,
         random_state=42,
         test_size=0.2,
-        cv_group_columns=["ActionGroup"],
-        cv_date_column="BatchDate",
+        split_group_columns=["ActionGroup"],
+        split_date_column="BatchDate",
         cv_source_df=df,
     )
 
@@ -182,8 +182,8 @@ def test_plan_splits_stratifytimecv_falls_back_to_timecv() -> None:
         cv_params={"n_splits": 4},
         random_state=42,
         test_size=0.2,
-        cv_date_column="BatchDate",
-        cv_stratify_column="Strata",
+        split_date_column="BatchDate",
+        split_stratify_column="Strata",
         cv_source_df=df,
     )
 
@@ -191,3 +191,63 @@ def test_plan_splits_stratifytimecv_falls_back_to_timecv() -> None:
     assert split_plan.split_info["cv"]["strategy_used"] == "timecv"
     assert split_plan.split_info["cv"]["fallback_applied"] is True
     assert len(split_plan.warnings) >= 1
+
+
+def test_plan_splits_uses_last_rows_for_test_holdout_by_default() -> None:
+    df = _sample_df_with_split_columns(n=20)
+    X = df[["x1", "x2"]]
+    y = df["Target"]
+    split_plan = plan_splits(
+        X=X,
+        y=y,
+        task="regression",
+        cv=3,
+        random_state=42,
+        test_size=0.15,
+        cv_source_df=df,
+    )
+
+    assert split_plan.split_info["test"]["splitter"] == "last_rows"
+    assert split_plan.split_info["test"]["test_size"] == 3
+    assert split_plan.test_indices.tolist() == [17, 18, 19]
+
+
+def test_plan_splits_orders_test_holdout_by_split_date_column() -> None:
+    df = _sample_df_with_split_columns(n=20).sample(frac=1.0, random_state=7).reset_index(drop=True)
+    X = df[["x1", "x2"]]
+    y = df["Target"]
+    split_plan = plan_splits(
+        X=X,
+        y=y,
+        task="regression",
+        cv=3,
+        random_state=42,
+        test_size=0.2,
+        split_date_column="BatchDate",
+        cv_source_df=df,
+    )
+    expected_test_idx = (
+        df.sort_values("BatchDate")
+        .tail(4)
+        .index.to_numpy(dtype=int)
+        .tolist()
+    )
+    assert split_plan.test_indices.tolist() == expected_test_idx
+
+
+def test_plan_splits_supports_test_size_rows() -> None:
+    df = _sample_df_with_split_columns(n=25)
+    X = df[["x1", "x2"]]
+    y = df["Target"]
+    split_plan = plan_splits(
+        X=X,
+        y=y,
+        task="regression",
+        cv=3,
+        random_state=42,
+        test_size=0.15,
+        test_size_rows=5,
+        cv_source_df=df,
+    )
+    assert split_plan.split_info["test"]["test_size"] == 5
+    assert split_plan.test_indices.tolist() == [20, 21, 22, 23, 24]

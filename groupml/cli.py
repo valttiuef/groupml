@@ -23,6 +23,33 @@ def _parse_cv_value(raw: str) -> int | str:
     return value
 
 
+def _resolve_test_size(
+    *,
+    test_size_pct: float,
+    test_size_rows: int | None,
+    legacy_test_size: float | None,
+) -> tuple[float, int | None]:
+    if test_size_rows is not None:
+        if test_size_rows < 1:
+            raise ValueError("--test-size-rows must be >= 1.")
+        if legacy_test_size is not None:
+            raise ValueError("Use either --test-size-rows or --test-size, not both.")
+        return 0.15, int(test_size_rows)
+
+    if legacy_test_size is not None:
+        if not 0.0 < legacy_test_size < 1.0:
+            raise ValueError("--test-size must be a fraction in (0, 1).")
+        return float(legacy_test_size), None
+
+    if not test_size_pct > 0.0:
+        raise ValueError("--test-size-pct must be > 0.")
+    if test_size_pct < 1.0:
+        return float(test_size_pct), None
+    if test_size_pct >= 100.0:
+        raise ValueError("--test-size-pct must be < 100.")
+    return float(test_size_pct) / 100.0, None
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the groupml CLI argument parser."""
     parser = argparse.ArgumentParser(
@@ -65,12 +92,26 @@ def build_parser() -> argparse.ArgumentParser:
             "(for example groupcv, timecv, stratifycv, stratifygroupcv, stratifytimecv)."
         ),
     )
-    parser.add_argument("--cv-group-column", default=None, help="Single group column used for CV grouping.")
-    parser.add_argument("--cv-date-column", default=None, help="Datetime column used for time-based CV.")
     parser.add_argument(
-        "--cv-stratify-column",
+        "--split-group-column",
+        "--cv-group-column",
+        dest="split_group_column",
         default=None,
-        help="Column used for stratified CV behavior.",
+        help="Single group column used for split-aware CV behavior.",
+    )
+    parser.add_argument(
+        "--split-date-column",
+        "--cv-date-column",
+        dest="split_date_column",
+        default=None,
+        help="Datetime column used for ordering test split and time-based CV.",
+    )
+    parser.add_argument(
+        "--split-stratify-column",
+        "--cv-stratify-column",
+        dest="split_stratify_column",
+        default=None,
+        help="Column used for stratified split behavior.",
     )
     parser.add_argument(
         "--scorer",
@@ -78,7 +119,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="sklearn scorer name (or 'rmse' alias).",
     )
     parser.add_argument("--task", choices=["auto", "regression", "classification"], default="auto")
-    parser.add_argument("--test-size", type=float, default=0.2, help="Holdout test size fraction.")
+    parser.add_argument(
+        "--test-split",
+        choices=["last_rows", "random"],
+        default="last_rows",
+        help="Holdout strategy. 'last_rows' uses tail rows (date-ordered if split_date_column is set).",
+    )
+    parser.add_argument("--test-size-pct", type=float, default=15.0, help="Holdout test size in percent (default 15).")
+    parser.add_argument("--test-size-rows", type=int, default=None, help="Holdout test size as absolute row count.")
+    parser.add_argument(
+        "--test-size",
+        type=float,
+        default=None,
+        help="Legacy alias: holdout test size fraction in (0,1).",
+    )
     parser.add_argument("--random-state", type=int, default=42, help="Random seed.")
     parser.add_argument("--min-group-size", type=int, default=15)
     parser.add_argument("--min-improvement", type=float, default=0.01)
@@ -110,6 +164,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run CLI command and return process exit code."""
     parser = build_parser()
     args = parser.parse_args(argv)
+    try:
+        test_size, test_size_rows = _resolve_test_size(
+            test_size_pct=args.test_size_pct,
+            test_size_rows=args.test_size_rows,
+            legacy_test_size=args.test_size,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     config = GroupMLConfig(
         target=args.target,
@@ -118,12 +180,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         rule_splits=args.rules or [],
         experiment_modes=args.modes or ["full", "group_as_features", "group_split", "group_permutations", "rule_split"],
         cv=_parse_cv_value(args.cv),
-        cv_group_column=args.cv_group_column,
-        cv_date_column=args.cv_date_column,
-        cv_stratify_column=args.cv_stratify_column,
+        split_group_column=args.split_group_column,
+        split_date_column=args.split_date_column,
+        split_stratify_column=args.split_stratify_column,
         scorer=args.scorer,
         task=args.task,
-        test_size=args.test_size,
+        test_split_strategy=args.test_split,
+        test_size=test_size,
+        test_size_rows=test_size_rows,
         random_state=args.random_state,
         min_group_size=args.min_group_size,
         min_improvement=args.min_improvement,

@@ -17,4 +17,4 @@ dist/
 
 # IDE
 .vscode/.ropeproject
-
+*.code-workspace

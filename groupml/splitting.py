@@ -104,7 +104,7 @@ class DateTimeSeriesSplitter:
             raise ValueError("n_splits must be >= 2 for time-series CV.")
         datetimes = pd.to_datetime(date_values, errors="coerce")
         if datetimes.isna().any():
-            raise ValueError("cv_date_column contains invalid datetime values.")
+            raise ValueError("split_date_column contains invalid datetime values.")
         self._ordered_idx = np.argsort(datetimes.to_numpy(), kind="mergesort")
         self._base = TimeSeriesSplit(n_splits=n_splits)
 
@@ -240,22 +240,61 @@ def _materialize_holdout(
     y: pd.Series,
     task: str,
     test_size: float,
+    test_size_rows: int | None,
     random_state: int,
+    split_source_df: pd.DataFrame,
+    split_date_column: str | None,
+    split_stratify_column: str | None,
+    test_split_strategy: str,
     test_splitter: Any = None,
 ) -> tuple[np.ndarray, np.ndarray, str]:
+    n_samples = len(X)
+    if n_samples < 2:
+        raise ValueError("Need at least 2 rows to create train/test holdout splits.")
+
+    if test_size_rows is not None:
+        n_test = int(test_size_rows)
+    else:
+        n_test = int(np.ceil(float(test_size) * float(n_samples)))
+    if n_test < 1 or n_test >= n_samples:
+        raise ValueError(
+            f"Resolved test set size ({n_test}) must be in [1, {n_samples - 1}] for {n_samples} rows."
+        )
+
     if test_splitter is None:
-        stratify = y if task == "classification" and y.nunique(dropna=True) > 1 else None
-        train_idx, test_idx = train_test_split(
-            np.arange(len(X)),
-            test_size=test_size,
-            random_state=random_state,
-            stratify=stratify,
-        )
-        return (
-            np.asarray(train_idx, dtype=int),
-            np.asarray(test_idx, dtype=int),
-            "train_test_split",
-        )
+        if test_split_strategy == "last_rows":
+            if split_date_column:
+                datetimes = pd.to_datetime(split_source_df[split_date_column], errors="coerce")
+                if datetimes.isna().any():
+                    raise ValueError("split_date_column contains invalid datetime values.")
+                ordered_idx = np.argsort(datetimes.to_numpy(), kind="mergesort")
+            else:
+                ordered_idx = np.arange(n_samples, dtype=int)
+            train_idx = ordered_idx[:-n_test]
+            test_idx = ordered_idx[-n_test:]
+            return (
+                np.asarray(train_idx, dtype=int),
+                np.asarray(test_idx, dtype=int),
+                "last_rows",
+            )
+        if test_split_strategy == "random":
+            stratify = None
+            if split_stratify_column:
+                stratify = split_source_df[split_stratify_column]
+            elif task == "classification" and y.nunique(dropna=True) > 1:
+                stratify = y
+            train_idx, test_idx = train_test_split(
+                np.arange(n_samples),
+                test_size=n_test,
+                random_state=random_state,
+                stratify=stratify,
+            )
+            return (
+                np.asarray(train_idx, dtype=int),
+                np.asarray(test_idx, dtype=int),
+                "train_test_split",
+            )
+        raise ValueError("Unknown test_split_strategy. Supported: 'last_rows', 'random'.")
 
     splitter = resolve_cv_splitter(
         cv=test_splitter,
@@ -269,15 +308,15 @@ def _materialize_holdout(
 
 def _infer_column_driven_cv(
     cv: Any,
-    cv_date_column: str | None,
-    cv_group_columns: Sequence[str] | None,
-    cv_stratify_column: str | None,
+    split_date_column: str | None,
+    split_group_columns: Sequence[str] | None,
+    split_stratify_column: str | None,
 ) -> Any:
     if not isinstance(cv, int):
         return cv
-    has_date = bool(cv_date_column)
-    has_groups = bool(list(cv_group_columns or []))
-    has_stratify = bool(cv_stratify_column)
+    has_date = bool(split_date_column)
+    has_groups = bool(list(split_group_columns or []))
+    has_stratify = bool(split_stratify_column)
 
     if has_stratify and has_date:
         return "stratifytimecv"
@@ -342,9 +381,9 @@ def _build_cv_splits(
 ) -> tuple[list[tuple[np.ndarray, np.ndarray]], str, dict[str, Any]]:
     selected_cv = _infer_column_driven_cv(
         cv=cv,
-        cv_date_column=cv_date_column,
-        cv_group_columns=cv_group_columns,
-        cv_stratify_column=cv_stratify_column,
+        split_date_column=cv_date_column,
+        split_group_columns=cv_group_columns,
+        split_stratify_column=cv_stratify_column,
     )
     inferred_from_columns = selected_cv != cv and isinstance(cv, int)
 
@@ -356,10 +395,10 @@ def _build_cv_splits(
     if key == "groupcv":
         group_columns_for_split = list(cv_group_columns or fallback_cv_group_columns)
         if not group_columns_for_split:
-            raise ValueError("groupcv requires cv_group_column/cv_group_columns.")
+            raise ValueError("groupcv requires split_group_column/split_group_columns.")
         groups = build_groups_array(cv_source_train, group_columns_for_split)
         if groups is None:
-            raise ValueError("groupcv requires cv_group_column/cv_group_columns.")
+            raise ValueError("groupcv requires split_group_column/split_group_columns.")
         splitter = GroupKFold(n_splits=n_splits)
         splits = _run_splitter(splitter, X_train, y_train, groups=groups)
         meta = {
@@ -376,7 +415,7 @@ def _build_cv_splits(
 
     if key == "timecv":
         if not cv_date_column:
-            raise ValueError("timecv requires cv_date_column.")
+            raise ValueError("timecv requires split_date_column.")
         splitter = DateTimeSeriesSplitter(cv_source_train[cv_date_column], n_splits=n_splits)
         splits = _run_splitter(splitter, X_train, y_train, groups=None)
         meta = {
@@ -393,7 +432,7 @@ def _build_cv_splits(
 
     if key == "stratifycv":
         if not cv_stratify_column:
-            raise ValueError("stratifycv requires cv_stratify_column.")
+            raise ValueError("stratifycv requires split_stratify_column.")
         splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
         splits = _run_splitter(splitter, X_train, cv_source_train[cv_stratify_column], groups=None)
         meta = {
@@ -410,7 +449,7 @@ def _build_cv_splits(
 
     if key in {"stratifygroupcv", "stratifytimecv"}:
         if not cv_stratify_column:
-            raise ValueError(f"{selected_cv} requires cv_stratify_column.")
+            raise ValueError(f"{selected_cv} requires split_stratify_column.")
         stratify_values = cv_source_train[cv_stratify_column]
         candidate_splits = _build_hybrid_stratified_splits(
             n_splits=n_splits,
@@ -421,10 +460,10 @@ def _build_cv_splits(
         if key == "stratifygroupcv":
             group_columns_for_split = list(cv_group_columns or fallback_cv_group_columns)
             if not group_columns_for_split:
-                raise ValueError("stratifygroupcv requires cv_group_column/cv_group_columns.")
+                raise ValueError("stratifygroupcv requires split_group_column/split_group_columns.")
             groups = build_groups_array(cv_source_train, group_columns_for_split)
             if groups is None:
-                raise ValueError("stratifygroupcv requires cv_group_column/cv_group_columns.")
+                raise ValueError("stratifygroupcv requires split_group_column/split_group_columns.")
             valid = all(_is_valid_group_split(train_idx, val_idx, groups) for train_idx, val_idx in candidate_splits)
             if valid:
                 meta = {
@@ -458,7 +497,7 @@ def _build_cv_splits(
             return fallback_splits, "GroupKFold", meta
 
         if not cv_date_column:
-            raise ValueError("stratifytimecv requires cv_date_column.")
+            raise ValueError("stratifytimecv requires split_date_column.")
         valid = all(
             _is_valid_time_split(train_idx, val_idx, cv_source_train[cv_date_column])
             for train_idx, val_idx in candidate_splits
@@ -504,13 +543,13 @@ def _build_cv_splits(
     if not selected_group_columns and _needs_groups(cv_splitter):
         raise ValueError(
             f"{_splitter_display_name(cv_splitter)} requires groups. "
-            "Set cv_group_column/cv_group_columns in GroupMLConfig."
+            "Set split_group_column/split_group_columns in GroupMLConfig."
         )
     groups = build_groups_array(cv_source_train, selected_group_columns)
     if _needs_groups(cv_splitter) and groups is None:
         raise ValueError(
             f"{_splitter_display_name(cv_splitter)} requires groups. "
-            "Set cv_group_column/cv_group_columns in GroupMLConfig."
+            "Set split_group_column/split_group_columns in GroupMLConfig."
         )
 
     cv_splits = _run_splitter(cv_splitter, X_train, y_train, groups=groups)
@@ -534,41 +573,65 @@ def plan_splits(
     cv: Any,
     random_state: int,
     test_size: float,
+    test_size_rows: int | None = None,
     cv_params: dict[str, Any] | None = None,
+    split_group_columns: Sequence[str] | None = None,
+    split_date_column: str | None = None,
+    split_stratify_column: str | None = None,
+    fallback_cv_group_columns: Sequence[str] | None = None,
+    test_splitter: Any = None,
+    test_split_strategy: str = "last_rows",
+    include_indices: bool = True,
+    cv_source_df: pd.DataFrame | None = None,
+    # Backward-compatible aliases.
     cv_group_columns: Sequence[str] | None = None,
     cv_date_column: str | None = None,
     cv_stratify_column: str | None = None,
-    fallback_cv_group_columns: Sequence[str] | None = None,
-    test_splitter: Any = None,
-    include_indices: bool = True,
-    cv_source_df: pd.DataFrame | None = None,
 ) -> SplitPlan:
     """Create holdout and CV splits with inspection metadata."""
     split_warnings: list[str] = []
+
+    resolved_split_group_columns = list(split_group_columns or cv_group_columns or [])
+    resolved_split_date_column = split_date_column or cv_date_column
+    resolved_split_stratify_column = split_stratify_column or cv_stratify_column
+
+    source_df = cv_source_df if cv_source_df is not None else X
+    if len(source_df) != len(X):
+        raise ValueError("cv_source_df must have the same row count as X.")
+    if resolved_split_date_column and resolved_split_date_column not in source_df.columns:
+        raise ValueError(f"split_date column '{resolved_split_date_column}' is missing from split source dataframe.")
+    if resolved_split_stratify_column and resolved_split_stratify_column not in source_df.columns:
+        raise ValueError(
+            f"split_stratify column '{resolved_split_stratify_column}' is missing from split source dataframe."
+        )
 
     train_idx, test_idx, test_splitter_name = _materialize_holdout(
         X=X,
         y=y,
         task=task,
         test_size=test_size,
+        test_size_rows=test_size_rows,
         random_state=random_state,
+        split_source_df=source_df,
+        split_date_column=resolved_split_date_column,
+        split_stratify_column=resolved_split_stratify_column,
+        test_split_strategy=test_split_strategy,
         test_splitter=test_splitter,
     )
     X_train = X.iloc[train_idx]
     y_train = y.iloc[train_idx]
 
-    source_df = cv_source_df if cv_source_df is not None else X
-    if len(source_df) != len(X):
-        raise ValueError("cv_source_df must have the same row count as X.")
     cv_source_train = source_df.iloc[train_idx]
 
-    explicit_cv_group_columns = list(cv_group_columns or [])
+    explicit_cv_group_columns = list(resolved_split_group_columns)
     fallback_group_columns = list(fallback_cv_group_columns or [])
 
-    if cv_date_column and cv_date_column not in cv_source_train.columns:
-        raise ValueError(f"cv_date column '{cv_date_column}' is missing from split source dataframe.")
-    if cv_stratify_column and cv_stratify_column not in cv_source_train.columns:
-        raise ValueError(f"cv_stratify column '{cv_stratify_column}' is missing from split source dataframe.")
+    if resolved_split_date_column and resolved_split_date_column not in cv_source_train.columns:
+        raise ValueError(f"split_date column '{resolved_split_date_column}' is missing from split source dataframe.")
+    if resolved_split_stratify_column and resolved_split_stratify_column not in cv_source_train.columns:
+        raise ValueError(
+            f"split_stratify column '{resolved_split_stratify_column}' is missing from split source dataframe."
+        )
     columns_for_presence_check = list(dict.fromkeys(explicit_cv_group_columns + fallback_group_columns))
     if columns_for_presence_check:
         missing = [c for c in columns_for_presence_check if c not in cv_source_train.columns]
@@ -584,8 +647,8 @@ def plan_splits(
         cv_params=dict(cv_params or {}),
         cv_group_columns=explicit_cv_group_columns,
         fallback_cv_group_columns=fallback_group_columns,
-        cv_date_column=cv_date_column,
-        cv_stratify_column=cv_stratify_column,
+        cv_date_column=resolved_split_date_column,
+        cv_stratify_column=resolved_split_stratify_column,
         cv_source_train=cv_source_train,
         warnings=split_warnings,
     )
@@ -607,14 +670,17 @@ def plan_splits(
             "splitter": test_splitter_name,
             "train_size": int(len(train_idx)),
             "test_size": int(len(test_idx)),
+            "strategy": "custom" if test_splitter is not None else test_split_strategy,
+            "date_column": resolved_split_date_column,
+            "stratify_column": resolved_split_stratify_column,
         },
         "cv": {
             "splitter": cv_splitter_name,
             "n_splits": int(len(cv_splits)),
             "uses_groups": bool(cv_meta.get("uses_groups", False)),
             "group_columns": list(cv_meta.get("group_columns", explicit_cv_group_columns + fallback_group_columns)),
-            "date_column": cv_meta.get("date_column", cv_date_column),
-            "stratify_column": cv_meta.get("stratify_column", cv_stratify_column),
+            "date_column": cv_meta.get("date_column", resolved_split_date_column),
+            "stratify_column": cv_meta.get("stratify_column", resolved_split_stratify_column),
             "strategy_requested": cv_meta.get("strategy_requested"),
             "strategy_used": cv_meta.get("strategy_used"),
             "fallback_applied": bool(cv_meta.get("fallback_applied", False)),

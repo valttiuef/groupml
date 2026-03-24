@@ -62,16 +62,16 @@ class GroupMLRunner:
         ensure_columns_exist(data, [r.column for r in parsed_rules], "rule")
         rule_columns = [r.column for r in parsed_rules]
 
-        cv_group_columns: list[str] = []
-        if self.config.cv_group_column:
-            cv_group_columns.append(self.config.cv_group_column)
-        cv_group_columns.extend(list(self.config.cv_group_columns or []))
-        cv_group_columns = list(dict.fromkeys(cv_group_columns))
-        cv_date_column = self.config.cv_date_column
-        cv_stratify_column = self.config.cv_stratify_column
-        ensure_columns_exist(data, cv_group_columns, "cv_group")
-        ensure_columns_exist(data, [cv_date_column] if cv_date_column else [], "cv_date")
-        ensure_columns_exist(data, [cv_stratify_column] if cv_stratify_column else [], "cv_stratify")
+        split_group_columns: list[str] = []
+        if self.config.split_group_column:
+            split_group_columns.append(self.config.split_group_column)
+        split_group_columns.extend(list(self.config.split_group_columns or []))
+        split_group_columns = list(dict.fromkeys(split_group_columns))
+        split_date_column = self.config.split_date_column
+        split_stratify_column = self.config.split_stratify_column
+        ensure_columns_exist(data, split_group_columns, "split_group")
+        ensure_columns_exist(data, [split_date_column] if split_date_column else [], "split_date")
+        ensure_columns_exist(data, [split_stratify_column] if split_stratify_column else [], "split_stratify")
 
         task = infer_task(data[self.config.target], self.config.task)
         data, feature_cols, task = self._preprocess_base_dataset(
@@ -79,9 +79,9 @@ class GroupMLRunner:
             feature_cols=feature_cols,
             group_cols=group_cols,
             rule_columns=rule_columns,
-            cv_group_columns=cv_group_columns,
-            cv_date_column=cv_date_column,
-            cv_stratify_column=cv_stratify_column,
+            split_group_columns=split_group_columns,
+            split_date_column=split_date_column,
+            split_stratify_column=split_stratify_column,
             task=task,
             warnings=warnings,
         )
@@ -96,12 +96,14 @@ class GroupMLRunner:
             cv=self.config.cv,
             random_state=self.config.random_state,
             test_size=self.config.test_size,
+            test_size_rows=self.config.test_size_rows,
             cv_params=self.config.cv_params,
-            cv_group_columns=cv_group_columns,
-            cv_date_column=cv_date_column,
-            cv_stratify_column=cv_stratify_column,
+            split_group_columns=split_group_columns,
+            split_date_column=split_date_column,
+            split_stratify_column=split_stratify_column,
             fallback_cv_group_columns=group_cols,
             test_splitter=self.config.test_splitter,
+            test_split_strategy=self.config.test_split_strategy,
             include_indices=self.config.include_split_indices,
             cv_source_df=data,
         )
@@ -148,6 +150,10 @@ class GroupMLRunner:
                 "cv_strategy_used": split_plan.split_info.get("cv", {}).get("strategy_used"),
                 "cv_fallback_applied": split_plan.split_info.get("cv", {}).get("fallback_applied"),
                 "cv_fallback_reason": split_plan.split_info.get("cv", {}).get("fallback_reason"),
+                "split_group_columns": split_plan.split_info.get("cv", {}).get("group_columns"),
+                "split_date_column": split_plan.split_info.get("cv", {}).get("date_column"),
+                "split_stratify_column": split_plan.split_info.get("cv", {}).get("stratify_column"),
+                # Backward-compatible callback aliases.
                 "cv_group_columns": split_plan.split_info.get("cv", {}).get("group_columns"),
                 "cv_date_column": split_plan.split_info.get("cv", {}).get("date_column"),
                 "cv_stratify_column": split_plan.split_info.get("cv", {}).get("stratify_column"),
@@ -344,9 +350,9 @@ class GroupMLRunner:
         feature_cols: list[str],
         group_cols: list[str],
         rule_columns: list[str],
-        cv_group_columns: list[str],
-        cv_date_column: str | None,
-        cv_stratify_column: str | None,
+        split_group_columns: list[str],
+        split_date_column: str | None,
+        split_stratify_column: str | None,
         task: str,
         warnings: list[str],
     ) -> tuple[pd.DataFrame, list[str], str]:
@@ -379,9 +385,9 @@ class GroupMLRunner:
                     + feature_cols
                     + group_cols
                     + rule_columns
-                    + cv_group_columns
-                    + ([cv_date_column] if cv_date_column else [])
-                    + ([cv_stratify_column] if cv_stratify_column else [])
+                    + split_group_columns
+                    + ([split_date_column] if split_date_column else [])
+                    + ([split_stratify_column] if split_stratify_column else [])
                 )
             )
             before = len(data)
@@ -392,11 +398,11 @@ class GroupMLRunner:
                     f"Base preprocessing dropped {dropped} rows containing NaNs in required columns."
                 )
 
-        protected = set(group_cols) | set(rule_columns) | set(cv_group_columns)
-        if cv_date_column:
-            protected.add(cv_date_column)
-        if cv_stratify_column:
-            protected.add(cv_stratify_column)
+        protected = set(group_cols) | set(rule_columns) | set(split_group_columns)
+        if split_date_column:
+            protected.add(split_date_column)
+        if split_stratify_column:
+            protected.add(split_stratify_column)
         if self.config.drop_static_base_features:
             static_features = [c for c in feature_cols if c not in protected and data[c].nunique(dropna=False) <= 1]
             if static_features:
