@@ -42,6 +42,34 @@ def test_group_split_mode_produces_rows() -> None:
     assert (result.leaderboard["mode"] == "group_permutations").any()
 
 
+def test_group_permutations_skipped_with_single_group_column() -> None:
+    rng = np.random.default_rng(8)
+    n = 160
+    df = pd.DataFrame(
+        {
+            "x1": rng.normal(0, 1, n),
+            "x2": rng.normal(0, 1, n),
+            "ActionGroup": rng.choice(["S1", "S2"], size=n),
+        }
+    )
+    df["Target"] = 1.8 * df["x1"] - 0.6 * df["x2"] + np.where(df["ActionGroup"] == "S2", 1.2, 0.0)
+
+    config = GroupMLConfig(
+        target="Target",
+        group_columns=["ActionGroup"],
+        experiment_modes=["group_split", "group_permutations"],
+        models=[LinearRegression()],
+        feature_selectors=["none"],
+        cv=3,
+        test_size=0.25,
+    )
+    result = GroupMLRunner(config).fit_evaluate(df)
+
+    assert (result.leaderboard["mode"] == "group_split").any()
+    assert not (result.leaderboard["mode"] == "group_permutations").any()
+    assert any("Skipping group_permutations: requires at least two group_columns." in msg for msg in result.warnings)
+
+
 def test_runner_auto_stratifies_by_group_columns_for_default_cv() -> None:
     rng = np.random.default_rng(17)
     n = 240
@@ -138,6 +166,7 @@ def test_raw_report_contains_best_predictions_per_method_columns() -> None:
 
     predicted_columns = [c for c in result.raw_report.columns if c.startswith("predicted_")]
     assert "prediction_method" in result.raw_report.columns
-    assert "predicted_onehot" in predicted_columns
-    assert "predicted_group_aware" in predicted_columns
-    assert len(predicted_columns) == 2
+    assert "predicted_no_group_awareness" in predicted_columns
+    assert "predicted_one_hot_group_features" in predicted_columns
+    assert "predicted_per_group_models" in predicted_columns
+    assert len(predicted_columns) == 3

@@ -13,12 +13,23 @@ from .config import GroupMLConfig
 from .file_utils import (
     default_report_filename,
     default_summary_filename,
+    export_reporting_bundle,
     export_raw_report,
     export_report,
     export_summary,
+    preferred_tabular_extension,
     fit_evaluate_file,
 )
 from .result import GroupMLResult
+
+
+MODE_LABELS = {
+    "full": "no_group_awareness",
+    "group_as_features": "one_hot_group_features",
+    "group_split": "per_group_models",
+    "group_permutations": "per_group_models_group_combos",
+    "rule_split": "rule_based_split",
+}
 
 
 def _parse_cv_value(raw: str) -> int | str:
@@ -206,7 +217,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--out",
         default=None,
-        help="Optional summary output path (.csv/.xls/.xlsx/.txt/.md/.json). Defaults to a timestamped .csv file.",
+        help=(
+            "Optional report output path. For tabular exports defaults to a timestamped .xlsx "
+            "(or .csv fallback when openpyxl is unavailable). "
+            "Supports .csv/.xls/.xlsx/.txt/.md/.json."
+        ),
+    )
+    parser.add_argument(
+        "--report-format",
+        choices=["auto", "excel", "csv"],
+        default="auto",
+        help=(
+            "Tabular report format. 'auto' prefers Excel workbook with separate sheets "
+            "and falls back to CSV files if openpyxl is unavailable."
+        ),
     )
     parser.add_argument(
         "--leaderboard-out",
@@ -289,9 +313,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return f"{parsed:.5f}"
 
     def _leaderboard_for_display(leaderboard: pd.DataFrame) -> pd.DataFrame:
-        if not rmse_display or leaderboard.empty:
-            return leaderboard
         display = leaderboard.copy()
+        if display.empty:
+            return display
+        if "mode" in display.columns and "method_type" not in display.columns:
+            display.insert(1, "method_type", display["mode"].map(lambda m: MODE_LABELS.get(str(m), str(m))))
+        if not rmse_display:
+            return display
         for col in ("cv_mean", "test_score"):
             if col not in display.columns:
                 continue
@@ -349,6 +377,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             partial_rows.append(
                 {
                     "mode": mode,
+                    "method_type": str(event.get("method_type", MODE_LABELS.get(mode, mode))),
                     "variant": variant,
                     "experiment_name": experiment_name,
                     "model": event.get("model", "unknown"),
@@ -390,25 +419,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             return
         if event_name == "mode_started":
             mode = event.get("mode", "unknown")
+            mode_label = MODE_LABELS.get(str(mode), str(mode))
             planned = int(event.get("planned_experiments", 0))
-            print(f"[groupml] Mode {mode}: {planned} experiment(s)")
+            print(f"[groupml] Mode {mode_label}: {planned} experiment(s)")
             return
         if event_name == "experiment_completed":
             done = int(event.get("completed_experiments", 0))
             total = int(event.get("total_experiments", 0))
             mode = event.get("mode", "unknown")
+            mode_label = str(event.get("method_type", MODE_LABELS.get(str(mode), str(mode))))
             model = event.get("model", "unknown")
             selector = event.get("selector", "unknown")
             cv_mean = _format_score(event.get("cv_mean"), positive_rmse=rmse_display)
             test_score = _format_score(event.get("test_score"), positive_rmse=rmse_display)
             if rmse_display:
                 print(
-                    f"[groupml] [{done}/{total}] {mode} | model={model} | selector={selector} "
+                    f"[groupml] [{done}/{total}] {mode_label} | model={model} | selector={selector} "
                     f"| cv_rmse={cv_mean} | test_rmse={test_score}"
                 )
             else:
                 print(
-                    f"[groupml] [{done}/{total}] {mode} | model={model} | selector={selector} "
+                    f"[groupml] [{done}/{total}] {mode_label} | model={model} | selector={selector} "
                     f"| cv_score={cv_mean} | test_score={test_score}"
                 )
 
@@ -428,11 +459,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         leaderboard = pd.DataFrame(partial_rows)
         if not leaderboard.empty:
-            leaderboard = leaderboard.sort_values(by=["cv_mean", "test_score"], ascending=False).reset_index(drop=True)
+            leaderboard = leaderboard.sort_values(by=["cv_mean"], ascending=False).reset_index(drop=True)
             best = leaderboard.iloc[0].to_dict()
             baseline_rows = leaderboard[leaderboard["mode"] == "full"]
             baseline = (
-                baseline_rows.sort_values(by=["cv_mean", "test_score"], ascending=False).iloc[0].to_dict()
+                baseline_rows.sort_values(by=["cv_mean"], ascending=False).iloc[0].to_dict()
                 if not baseline_rows.empty
                 else best
             )
@@ -463,15 +494,52 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("Leaderboard:")
     print(_leaderboard_for_display(result.leaderboard).head(args.top).to_string(index=False))
 
-    out_path = Path(args.out) if args.out else Path.cwd() / default_summary_filename(ext=".csv")
-    saved_path = export_summary(result, out_path, top_n=args.top)
-    print()
-    print(f"Saved summary: {saved_path}")
+    out_path = Path(args.out) if args.out else Path.cwd() / default_summary_filename(
+        ext=preferred_tabular_extension(args.report_format)
+    )
+    output_suffix = out_path.suffix.lower()
+    text_like_suffixes = {".txt", ".md", ".json"}
+    saved_path = out_path
+    used_bundle_export = output_suffix not in text_like_suffixes
+    if not used_bundle_export:
+        saved_path = export_summary(result, out_path, top_n=args.top)
+        print()
+        print(f"Saved summary: {saved_path}")
+    else:
+        bundle_outputs = export_reporting_bundle(
+            result=result,
+            path=out_path,
+            top_n=args.top,
+            report_format=args.report_format,
+            include_raw=not args.no_raw_report,
+        )
+        print()
+        if "workbook" in bundle_outputs:
+            print(f"Saved report workbook: {bundle_outputs['workbook']}")
+            print("Workbook sheets: summary, recommendations, warnings, all_runs, raw_results")
+        else:
+            if "summary" in bundle_outputs:
+                print(f"Saved summary: {bundle_outputs['summary']}")
+            if "recommendations" in bundle_outputs:
+                print(f"Saved recommendations: {bundle_outputs['recommendations']}")
+            if "warnings" in bundle_outputs:
+                print(f"Saved warnings: {bundle_outputs['warnings']}")
+            if "all_runs" in bundle_outputs:
+                print(f"Saved all runs: {bundle_outputs['all_runs']}")
+            if "raw_results" in bundle_outputs:
+                print(f"Saved raw results: {bundle_outputs['raw_results']}")
+        saved_path = bundle_outputs.get("summary", out_path)
 
     if args.leaderboard_out:
         leaderboard_path = export_report(result, Path(args.leaderboard_out))
         print(f"Saved leaderboard: {leaderboard_path}")
-    if not args.no_raw_report and isinstance(result.raw_report, pd.DataFrame) and (interrupted or not result.raw_report.empty):
+    should_export_separate_raw = bool(args.raw_report_out) or not used_bundle_export
+    if (
+        should_export_separate_raw
+        and not args.no_raw_report
+        and isinstance(result.raw_report, pd.DataFrame)
+        and (interrupted or not result.raw_report.empty)
+    ):
         if args.raw_report_out:
             raw_report_path = Path(args.raw_report_out)
         else:

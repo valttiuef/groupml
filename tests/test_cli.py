@@ -41,18 +41,19 @@ def test_cli_main_parses_arguments(monkeypatch) -> None:
             baseline_experiment=leaderboard.iloc[0].to_dict(),
         )
 
-    def _fake_export_summary(
+    def _fake_export_bundle(
         result: GroupMLResult,
         path: str | Path,
         top_n: int = 10,
-        sheet_name: str = "summary",
-    ) -> Path:
-        del result, top_n, sheet_name
+        report_format: str = "auto",
+        include_raw: bool = True,
+    ) -> dict[str, Path]:
+        del result, top_n, report_format, include_raw
         captured["summary_export_path"] = Path(path)
-        return Path(path)
+        return {"summary": Path(path)}
 
     monkeypatch.setattr(cli, "fit_evaluate_file", _fake_fit_evaluate_file)
-    monkeypatch.setattr(cli, "export_summary", _fake_export_summary)
+    monkeypatch.setattr(cli, "export_reporting_bundle", _fake_export_bundle)
     monkeypatch.setattr(cli, "default_summary_filename", lambda ext=".csv": f"default_name{ext}")
 
     exit_code = cli.main(
@@ -102,7 +103,7 @@ def test_cli_main_parses_arguments(monkeypatch) -> None:
     assert captured["read_kwargs"] == {"sheet_name": "SheetA"}
     assert isinstance(captured["callbacks"], list)
     assert len(captured["callbacks"]) == 1
-    assert captured["summary_export_path"] == Path.cwd() / "default_name.csv"
+    assert captured["summary_export_path"].name.startswith("default_name.")
 
 
 def test_cli_main_parses_cv_fold_size_rows(monkeypatch) -> None:
@@ -138,7 +139,11 @@ def test_cli_main_parses_cv_fold_size_rows(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(cli, "fit_evaluate_file", _fake_fit_evaluate_file)
-    monkeypatch.setattr(cli, "export_summary", lambda result, path, top_n=10, sheet_name="summary": Path(path))
+    monkeypatch.setattr(
+        cli,
+        "export_reporting_bundle",
+        lambda result, path, top_n=10, report_format="auto", include_raw=True: {"summary": Path(path)},
+    )
     monkeypatch.setattr(cli, "default_summary_filename", lambda ext=".csv": f"default_name{ext}")
 
     exit_code = cli.main(
@@ -192,7 +197,11 @@ def test_cli_main_parses_cv_columns(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(cli, "fit_evaluate_file", _fake_fit_evaluate_file)
-    monkeypatch.setattr(cli, "export_summary", lambda result, path, top_n=10, sheet_name="summary": Path(path))
+    monkeypatch.setattr(
+        cli,
+        "export_reporting_bundle",
+        lambda result, path, top_n=10, report_format="auto", include_raw=True: {"summary": Path(path)},
+    )
     monkeypatch.setattr(cli, "default_summary_filename", lambda ext=".csv": f"default_name{ext}")
 
     exit_code = cli.main(
@@ -254,7 +263,11 @@ def test_cli_main_parses_test_size_rows(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(cli, "fit_evaluate_file", _fake_fit_evaluate_file)
-    monkeypatch.setattr(cli, "export_summary", lambda result, path, top_n=10, sheet_name="summary": Path(path))
+    monkeypatch.setattr(
+        cli,
+        "export_reporting_bundle",
+        lambda result, path, top_n=10, report_format="auto", include_raw=True: {"summary": Path(path)},
+    )
     monkeypatch.setattr(cli, "default_summary_filename", lambda ext=".csv": f"default_name{ext}")
 
     exit_code = cli.main(
@@ -312,7 +325,11 @@ def test_cli_main_parses_test_size_auto_rows(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(cli, "fit_evaluate_file", _fake_fit_evaluate_file)
-    monkeypatch.setattr(cli, "export_summary", lambda result, path, top_n=10, sheet_name="summary": Path(path))
+    monkeypatch.setattr(
+        cli,
+        "export_reporting_bundle",
+        lambda result, path, top_n=10, report_format="auto", include_raw=True: {"summary": Path(path)},
+    )
     monkeypatch.setattr(cli, "default_summary_filename", lambda ext=".csv": f"default_name{ext}")
 
     exit_code = cli.main(
@@ -366,7 +383,11 @@ def test_cli_main_parses_test_size_pct_with_integer_percent(monkeypatch) -> None
         )
 
     monkeypatch.setattr(cli, "fit_evaluate_file", _fake_fit_evaluate_file)
-    monkeypatch.setattr(cli, "export_summary", lambda result, path, top_n=10, sheet_name="summary": Path(path))
+    monkeypatch.setattr(
+        cli,
+        "export_reporting_bundle",
+        lambda result, path, top_n=10, report_format="auto", include_raw=True: {"summary": Path(path)},
+    )
     monkeypatch.setattr(cli, "default_summary_filename", lambda ext=".csv": f"default_name{ext}")
 
     exit_code = cli.main(
@@ -422,7 +443,11 @@ def test_cli_main_parses_test_size_auto_decimal_percent(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(cli, "fit_evaluate_file", _fake_fit_evaluate_file)
-    monkeypatch.setattr(cli, "export_summary", lambda result, path, top_n=10, sheet_name="summary": Path(path))
+    monkeypatch.setattr(
+        cli,
+        "export_reporting_bundle",
+        lambda result, path, top_n=10, report_format="auto", include_raw=True: {"summary": Path(path)},
+    )
     monkeypatch.setattr(cli, "default_summary_filename", lambda ext=".csv": f"default_name{ext}")
 
     exit_code = cli.main(
@@ -447,7 +472,11 @@ def test_cli_main_rejects_invalid_manual_test_size(monkeypatch) -> None:
     from groupml import cli
 
     monkeypatch.setattr(cli, "fit_evaluate_file", lambda *args, **kwargs: None)
-    monkeypatch.setattr(cli, "export_summary", lambda result, path, top_n=10, sheet_name="summary": Path(path))
+    monkeypatch.setattr(
+        cli,
+        "export_reporting_bundle",
+        lambda result, path, top_n=10, report_format="auto", include_raw=True: {"summary": Path(path)},
+    )
     monkeypatch.setattr(cli, "default_summary_filename", lambda ext=".csv": f"default_name{ext}")
 
     with pytest.raises(SystemExit):
@@ -509,22 +538,23 @@ def test_cli_main_writes_output_file(monkeypatch, tmp_path: Path) -> None:
             baseline_experiment=leaderboard.iloc[0].to_dict(),
         )
 
-    def _fake_export_summary(
+    def _fake_export_bundle(
         result: GroupMLResult,
         path: str | Path,
         top_n: int = 10,
-        sheet_name: str = "summary",
-    ) -> Path:
-        del result, top_n, sheet_name
+        report_format: str = "auto",
+        include_raw: bool = True,
+    ) -> dict[str, Path]:
+        del result, top_n, report_format, include_raw
         out_path = Path(path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame([{"section": "overview", "metric": "best_experiment", "value": "full"}]).to_csv(
+        pd.DataFrame([{"section": "full_dataset_best", "method_type": "no_group_awareness"}]).to_csv(
             out_path, index=False
         )
-        return out_path
+        return {"summary": out_path}
 
     monkeypatch.setattr(cli, "fit_evaluate_file", _fake_fit_evaluate_file)
-    monkeypatch.setattr(cli, "export_summary", _fake_export_summary)
+    monkeypatch.setattr(cli, "export_reporting_bundle", _fake_export_bundle)
 
     exit_code = cli.main(
         [
@@ -594,7 +624,11 @@ def test_cli_progress_callback_prints_cv_and_test_scores(monkeypatch, capsys) ->
         )
 
     monkeypatch.setattr(cli, "fit_evaluate_file", _fake_fit_evaluate_file)
-    monkeypatch.setattr(cli, "export_summary", lambda result, path, top_n=10, sheet_name="summary": Path(path))
+    monkeypatch.setattr(
+        cli,
+        "export_reporting_bundle",
+        lambda result, path, top_n=10, report_format="auto", include_raw=True: {"summary": Path(path)},
+    )
     monkeypatch.setattr(cli, "default_summary_filename", lambda ext=".csv": f"default_name{ext}")
 
     exit_code = cli.main(["--path", "data.csv", "--target", "Target", "--scorer", "r2"])
@@ -656,7 +690,11 @@ def test_cli_progress_callback_prints_positive_rmse(monkeypatch, capsys) -> None
         )
 
     monkeypatch.setattr(cli, "fit_evaluate_file", _fake_fit_evaluate_file)
-    monkeypatch.setattr(cli, "export_summary", lambda result, path, top_n=10, sheet_name="summary": Path(path))
+    monkeypatch.setattr(
+        cli,
+        "export_reporting_bundle",
+        lambda result, path, top_n=10, report_format="auto", include_raw=True: {"summary": Path(path)},
+    )
     monkeypatch.setattr(cli, "default_summary_filename", lambda ext=".csv": f"default_name{ext}")
 
     exit_code = cli.main(
@@ -733,16 +771,17 @@ def test_cli_main_exports_partial_outputs_on_keyboard_interrupt(monkeypatch, tmp
             )
         raise KeyboardInterrupt()
 
-    def _fake_export_summary(
+    def _fake_export_bundle(
         result: GroupMLResult,
         path: str | Path,
         top_n: int = 10,
-        sheet_name: str = "summary",
-    ) -> Path:
-        del top_n, sheet_name
+        report_format: str = "auto",
+        include_raw: bool = True,
+    ) -> dict[str, Path]:
+        del top_n, report_format, include_raw
         captured["summary_result"] = result
         captured["summary_export_path"] = Path(path)
-        return Path(path)
+        return {"summary": Path(path)}
 
     def _fake_export_report(
         result: GroupMLResult,
@@ -765,7 +804,7 @@ def test_cli_main_exports_partial_outputs_on_keyboard_interrupt(monkeypatch, tmp
         return Path(path)
 
     monkeypatch.setattr(cli, "fit_evaluate_file", _fake_fit_evaluate_file)
-    monkeypatch.setattr(cli, "export_summary", _fake_export_summary)
+    monkeypatch.setattr(cli, "export_reporting_bundle", _fake_export_bundle)
     monkeypatch.setattr(cli, "export_report", _fake_export_report)
     monkeypatch.setattr(cli, "export_raw_report", _fake_export_raw_report)
 

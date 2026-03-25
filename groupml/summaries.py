@@ -37,13 +37,318 @@ def _best_by_average(leaderboard: pd.DataFrame, column: str) -> dict[str, Any]:
             runs=(column, "size"),
         )
         .reset_index()
-        .sort_values(by=["avg_cv_mean", "best_cv_mean", "avg_test_score"], ascending=False)
+        .sort_values(by=["avg_cv_mean", "best_cv_mean"], ascending=False)
     )
     if stats.empty:
         return {}
     row = stats.iloc[0].to_dict()
     row["value"] = row.get(column)
     return row
+
+
+SUMMARY_COLUMNS = [
+    "section",
+    "view_order",
+    "scope",
+    "group_column",
+    "group_value",
+    "method_type",
+    "mode",
+    "variant",
+    "experiment_name",
+    "model",
+    "selector",
+    "cv_mean",
+    "test_score",
+    "n_eval_rows",
+    "metric_name",
+    "metric_value",
+    "notes",
+]
+
+MODE_TO_METHOD_TYPE = {
+    "full": "no_group_awareness",
+    "group_as_features": "one_hot_group_features",
+    "group_split": "per_group_models",
+    "group_permutations": "per_group_models_group_combos",
+    "rule_split": "rule_based_split",
+}
+
+METHOD_TYPE_TO_MODE = {value: key for key, value in MODE_TO_METHOD_TYPE.items()}
+METHOD_ORDER = [
+    "no_group_awareness",
+    "one_hot_group_features",
+    "per_group_models",
+    "per_group_models_group_combos",
+    "rule_based_split",
+]
+
+RECOMMENDATION_COLUMNS = [
+    "recommendation_scope",
+    "rank",
+    "group_column",
+    "group_value",
+    "method_type",
+    "mode",
+    "experiment_name",
+    "model",
+    "selector",
+    "cv_mean",
+    "test_score",
+    "metric_name",
+    "metric_value",
+    "recommendation",
+    "notes",
+]
+
+
+def _empty_summary_table() -> pd.DataFrame:
+    return pd.DataFrame(columns=SUMMARY_COLUMNS)
+
+
+def _best_by_mode(leaderboard: pd.DataFrame) -> dict[str, dict[str, Any]]:
+    if leaderboard.empty:
+        return {}
+    if "mode" not in leaderboard.columns:
+        return {}
+    ordered = leaderboard.sort_values(by=["cv_mean"], ascending=False)
+    rows = ordered.drop_duplicates(subset=["mode"], keep="first")
+    return {str(row["mode"]): row for row in rows.to_dict(orient="records")}
+
+
+def _resolve_group_columns(result: "GroupMLResult", raw_report: pd.DataFrame) -> list[str]:
+    split_info = result.split_info if isinstance(result.split_info, dict) else {}
+    configured_cols = list(split_info.get("configured_group_columns", []) or [])
+    configured_cols = [c for c in configured_cols if c in raw_report.columns]
+    if configured_cols:
+        return configured_cols
+
+    split_cols = list((split_info.get("cv", {}) or {}).get("group_columns", []) or [])
+    split_cols = [c for c in split_cols if c in raw_report.columns]
+    if split_cols:
+        return split_cols
+
+    excluded = {
+        "row_index",
+        "split_assignment",
+        "actual",
+        "predicted",
+        "error",
+        "prediction_method",
+        "mode",
+        "method_type",
+        "experiment_name",
+        "model",
+        "selector",
+    }
+    excluded.update({c for c in raw_report.columns if c.startswith("predicted_") or c.startswith("error_")})
+    candidates = [
+        c
+        for c in raw_report.columns
+        if c not in excluded and not str(c).startswith("__groupml_auto_stratify__")
+    ]
+    out: list[str] = []
+    max_cardinality = max(2, min(20, int(len(raw_report) * 0.2)))
+    for col in candidates:
+        unique_count = raw_report[col].nunique(dropna=False)
+        if unique_count <= 1:
+            continue
+        if unique_count > max_cardinality:
+            continue
+        if pd.api.types.is_numeric_dtype(raw_report[col]):
+            continue
+        out.append(col)
+    return out
+
+
+def _build_full_dataset_rows(
+    leaderboard: pd.DataFrame,
+    best_mode_map: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for method_type in METHOD_ORDER:
+        mode = METHOD_TYPE_TO_MODE[method_type]
+        best = best_mode_map.get(mode, {})
+        if not best:
+            continue
+        rows.append(
+            {
+                "section": "full_dataset_best",
+                "view_order": 1,
+                "scope": "dataset",
+                "group_column": "",
+                "group_value": "ALL",
+                "method_type": method_type,
+                "mode": mode,
+                "variant": best.get("variant", ""),
+                "experiment_name": best.get("experiment_name", ""),
+                "model": best.get("model", ""),
+                "selector": best.get("selector", ""),
+                "cv_mean": _safe_float(best.get("cv_mean")),
+                "test_score": _safe_float(best.get("test_score")),
+                "n_eval_rows": np.nan,
+                "metric_name": "best_config",
+                "metric_value": _safe_float(best.get("cv_mean")),
+                "notes": "",
+            }
+        )
+    return rows
+
+
+def _build_per_group_rows(
+    result: "GroupMLResult",
+    raw_report: pd.DataFrame,
+    best_mode_map: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if raw_report.empty:
+        return []
+    predicted_cols = [
+        c for c in raw_report.columns if c.startswith("predicted_") and c != "predicted"
+    ]
+    if not predicted_cols:
+        return []
+    group_cols = _resolve_group_columns(result, raw_report)
+    if not group_cols:
+        return []
+
+    eval_mask = raw_report.get("split_assignment", pd.Series([""] * len(raw_report))).astype(str) != "train"
+    output: list[dict[str, Any]] = []
+    for pred_col in sorted(predicted_cols):
+        method_type = pred_col.replace("predicted_", "", 1)
+        mapped_mode = METHOD_TYPE_TO_MODE.get(method_type, "")
+        best_row = best_mode_map.get(mapped_mode, {})
+
+        subset = raw_report.loc[eval_mask, ["actual", pred_col] + group_cols].copy()
+        subset = subset.dropna(subset=[pred_col])
+        if subset.empty:
+            continue
+
+        actual_num = pd.to_numeric(subset["actual"], errors="coerce")
+        pred_num = pd.to_numeric(subset[pred_col], errors="coerce")
+        is_numeric = actual_num.notna().all() and pred_num.notna().all()
+        metric_name = "rmse" if is_numeric else "accuracy"
+        overall_n_eval = int(len(subset))
+        if overall_n_eval > 0:
+            if is_numeric:
+                overall_actual = pd.to_numeric(subset["actual"], errors="coerce")
+                overall_pred = pd.to_numeric(subset[pred_col], errors="coerce")
+                overall_err = overall_pred - overall_actual
+                overall_metric = float(np.sqrt(np.mean(np.square(overall_err))))
+            else:
+                overall_metric = float((subset[pred_col] == subset["actual"]).mean())
+            output.append(
+                {
+                    "section": "overall_method_comparison",
+                    "view_order": 2,
+                    "scope": "dataset",
+                    "group_column": "",
+                    "group_value": "ALL",
+                    "method_type": method_type,
+                    "mode": mapped_mode,
+                    "variant": best_row.get("variant", ""),
+                    "experiment_name": best_row.get("experiment_name", ""),
+                    "model": best_row.get("model", ""),
+                    "selector": best_row.get("selector", ""),
+                    "cv_mean": _safe_float(best_row.get("cv_mean")),
+                    "test_score": _safe_float(best_row.get("test_score")),
+                    "n_eval_rows": overall_n_eval,
+                    "metric_name": metric_name,
+                    "metric_value": overall_metric,
+                    "notes": "",
+                }
+            )
+
+        for group_col in group_cols:
+            for group_value, group_df in subset.groupby(group_col, dropna=False):
+                n_eval = int(len(group_df))
+                if n_eval == 0:
+                    continue
+                if is_numeric:
+                    actual_values = pd.to_numeric(group_df["actual"], errors="coerce")
+                    pred_values = pd.to_numeric(group_df[pred_col], errors="coerce")
+                    err = pred_values - actual_values
+                    metric_value = float(np.sqrt(np.mean(np.square(err))))
+                else:
+                    metric_value = float((group_df[pred_col] == group_df["actual"]).mean())
+                group_value_str = "" if pd.isna(group_value) else str(group_value)
+                output.append(
+                    {
+                        "section": "per_group_comparison",
+                        "view_order": 2,
+                        "scope": "group",
+                        "group_column": group_col,
+                        "group_value": group_value_str,
+                        "method_type": method_type,
+                        "mode": mapped_mode,
+                        "variant": best_row.get("variant", ""),
+                        "experiment_name": best_row.get("experiment_name", ""),
+                        "model": best_row.get("model", ""),
+                        "selector": best_row.get("selector", ""),
+                        "cv_mean": _safe_float(best_row.get("cv_mean")),
+                        "test_score": _safe_float(best_row.get("test_score")),
+                        "n_eval_rows": n_eval,
+                        "metric_name": metric_name,
+                        "metric_value": metric_value,
+                        "notes": "",
+                    }
+                )
+    return output
+
+
+def _build_recommendation_table(
+    leaderboard: pd.DataFrame,
+    result: "GroupMLResult",
+    top_n: int,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    best_experiment = result.best_experiment or {}
+    if best_experiment:
+        best_mode = str(best_experiment.get("mode", ""))
+        rows.append(
+            {
+                "recommendation_scope": "recommended_setup",
+                "rank": 1,
+                "group_column": "",
+                "group_value": "ALL",
+                "method_type": MODE_TO_METHOD_TYPE.get(best_mode, best_mode),
+                "mode": best_mode,
+                "experiment_name": best_experiment.get("experiment_name", ""),
+                "model": best_experiment.get("model", ""),
+                "selector": best_experiment.get("selector", ""),
+                "cv_mean": _safe_float(best_experiment.get("cv_mean")),
+                "test_score": _safe_float(best_experiment.get("test_score")),
+                "metric_name": "cv_mean",
+                "metric_value": _safe_float(best_experiment.get("cv_mean")),
+                "recommendation": str(result.recommendation),
+                "notes": "Chosen using CV-first ranking. Test is display-only.",
+            }
+        )
+    if not leaderboard.empty:
+        top_rows = leaderboard.head(max(1, int(top_n)))
+        for rank, (_, row) in enumerate(top_rows.iterrows(), start=1):
+            mode = str(row.get("mode", ""))
+            rows.append(
+                {
+                    "recommendation_scope": "top_n_overall",
+                    "rank": rank,
+                    "group_column": "",
+                    "group_value": "ALL",
+                    "method_type": MODE_TO_METHOD_TYPE.get(mode, mode),
+                    "mode": mode,
+                    "experiment_name": row.get("experiment_name", ""),
+                    "model": row.get("model", ""),
+                    "selector": row.get("selector", ""),
+                    "cv_mean": _safe_float(row.get("cv_mean")),
+                    "test_score": _safe_float(row.get("test_score")),
+                    "metric_name": "cv_mean",
+                    "metric_value": _safe_float(row.get("cv_mean")),
+                    "recommendation": "",
+                    "notes": "Ranked by CV only. Test is display-only.",
+                }
+            )
+    if not rows:
+        return pd.DataFrame(columns=RECOMMENDATION_COLUMNS)
+    return pd.DataFrame(rows, columns=RECOMMENDATION_COLUMNS)
 
 
 def build_summary_payload(result: "GroupMLResult", top_n: int = 5) -> dict[str, Any]:
@@ -73,7 +378,7 @@ def build_summary_payload(result: "GroupMLResult", top_n: int = 5) -> dict[str, 
             baseline_experiment = leaderboard.iloc[0].to_dict()
         else:
             baseline_experiment = baseline_rows.sort_values(
-                by=["cv_mean", "test_score"], ascending=False
+                by=["cv_mean"], ascending=False
             ).iloc[0].to_dict()
 
     cv_improvement_vs_baseline = _safe_float(best_experiment.get("cv_mean")) - _safe_float(
@@ -134,31 +439,34 @@ def build_summary_tables(result: "GroupMLResult", top_n: int = 10) -> dict[str, 
     }
 
     leaderboard = result.leaderboard
-    if not leaderboard.empty:
+    best_mode_map = _best_by_mode(leaderboard)
+    if not leaderboard.empty and "mode" in leaderboard.columns:
         tables["by_mode"] = (
             leaderboard.groupby("mode", dropna=False)
             .agg(avg_cv_mean=("cv_mean", "mean"), avg_test_score=("test_score", "mean"), runs=("mode", "size"))
-            .sort_values(by=["avg_cv_mean", "avg_test_score"], ascending=False)
+            .sort_values(by=["avg_cv_mean"], ascending=False)
             .reset_index()
         )
-        tables["by_model"] = (
-            leaderboard.groupby("model", dropna=False)
-            .agg(avg_cv_mean=("cv_mean", "mean"), avg_test_score=("test_score", "mean"), runs=("model", "size"))
-            .sort_values(by=["avg_cv_mean", "avg_test_score"], ascending=False)
-            .reset_index()
-        )
-        tables["by_selector"] = (
-            leaderboard.groupby("selector", dropna=False)
-            .agg(
-                avg_cv_mean=("cv_mean", "mean"),
-                avg_test_score=("test_score", "mean"),
-                runs=("selector", "size"),
+        if "model" in leaderboard.columns:
+            tables["by_model"] = (
+                leaderboard.groupby("model", dropna=False)
+                .agg(avg_cv_mean=("cv_mean", "mean"), avg_test_score=("test_score", "mean"), runs=("model", "size"))
+                .sort_values(by=["avg_cv_mean"], ascending=False)
+                .reset_index()
             )
-            .sort_values(by=["avg_cv_mean", "avg_test_score"], ascending=False)
-            .reset_index()
-        )
+        if "selector" in leaderboard.columns:
+            tables["by_selector"] = (
+                leaderboard.groupby("selector", dropna=False)
+                .agg(
+                    avg_cv_mean=("cv_mean", "mean"),
+                    avg_test_score=("test_score", "mean"),
+                    runs=("selector", "size"),
+                )
+                .sort_values(by=["avg_cv_mean"], ascending=False)
+                .reset_index()
+            )
         best_by_mode = (
-            leaderboard.sort_values(by=["cv_mean", "test_score"], ascending=False)
+            leaderboard.sort_values(by=["cv_mean"], ascending=False)
             .drop_duplicates(subset=["mode"], keep="first")
             .loc[
                 :,
@@ -171,90 +479,44 @@ def build_summary_tables(result: "GroupMLResult", top_n: int = 10) -> dict[str, 
             .reset_index(drop=True)
         )
         tables["best_method_configs"] = best_by_mode
-        best_mode_map = {str(row["mode"]): row for row in best_by_mode.to_dict(orient="records")}
-        best_group_aware = (
-            leaderboard[leaderboard["mode"].isin(["group_split", "group_permutations", "rule_split"])]
-            .sort_values(by=["cv_mean", "test_score"], ascending=False)
-            .head(1)
-        )
-        method_to_config: dict[str, dict[str, Any]] = {}
-        if "group_as_features" in best_mode_map:
-            method_to_config["onehot"] = best_mode_map["group_as_features"]
-        if "full" in best_mode_map:
-            method_to_config["full"] = best_mode_map["full"]
-        if not best_group_aware.empty:
-            method_to_config["group_aware"] = best_group_aware.iloc[0].to_dict()
-    else:
-        method_to_config = {}
 
     raw_report = result.raw_report if isinstance(result.raw_report, pd.DataFrame) else pd.DataFrame()
+    summary_rows = _build_full_dataset_rows(leaderboard=leaderboard, best_mode_map=best_mode_map)
+    summary_rows.extend(
+        _build_per_group_rows(result=result, raw_report=raw_report, best_mode_map=best_mode_map)
+    )
+    if summary_rows:
+        summary_table = pd.DataFrame(summary_rows, columns=SUMMARY_COLUMNS)
+        summary_table = summary_table.sort_values(
+            by=["view_order", "section", "group_column", "group_value", "method_type"]
+        ).reset_index(drop=True)
+    else:
+        summary_table = _empty_summary_table()
+    tables["summary"] = summary_table
+    tables["recommendations"] = _build_recommendation_table(leaderboard=leaderboard, result=result, top_n=top_n)
+
     if not raw_report.empty:
-        predicted_cols = [c for c in raw_report.columns if c.startswith("predicted_")]
-        group_cols = list((result.split_info or {}).get("cv", {}).get("group_columns", []) or [])
-        group_cols = [c for c in group_cols if c in raw_report.columns]
-        if not group_cols:
-            excluded = {
-                "row_index",
-                "split_assignment",
-                "actual",
-                "predicted",
-                "error",
-                "prediction_method",
-            }
-            excluded.update({c for c in raw_report.columns if c.startswith("predicted_") or c.startswith("error_")})
-            fallback_candidates = [
-                c
-                for c in raw_report.columns
-                if c not in excluded and not str(c).startswith("__groupml_auto_stratify__")
-            ]
-            group_cols = [
-                c
-                for c in fallback_candidates
-                if not pd.api.types.is_numeric_dtype(raw_report[c]) and raw_report[c].nunique(dropna=False) > 1
-            ][:1]
-        if predicted_cols and group_cols:
-            eval_mask = raw_report.get("split_assignment", pd.Series([""] * len(raw_report))).astype(str) != "train"
-            group_key = raw_report[group_cols].apply(
-                lambda row: "||".join("" if pd.isna(value) else str(value) for value in row.tolist()),
-                axis=1,
+        per_group = summary_table[summary_table["section"] == "per_group_comparison"].copy()
+        if not per_group.empty:
+            tables["group_performance"] = (
+                per_group.loc[
+                    :,
+                    [
+                        "group_column",
+                        "group_value",
+                        "method_type",
+                        "mode",
+                        "experiment_name",
+                        "model",
+                        "selector",
+                        "n_eval_rows",
+                        "metric_name",
+                        "metric_value",
+                    ],
+                ]
+                .sort_values(by=["group_column", "group_value", "method_type"])
+                .reset_index(drop=True)
             )
-            rows: list[dict[str, Any]] = []
-            for pred_col in predicted_cols:
-                method = pred_col.replace("predicted_", "", 1)
-                subset = raw_report.loc[eval_mask, ["actual", pred_col]].copy()
-                subset = subset.dropna(subset=[pred_col])
-                if subset.empty:
-                    continue
-                for key in sorted(group_key[subset.index].unique().tolist()):
-                    idx = group_key[subset.index] == key
-                    chunk = subset.loc[idx]
-                    n = len(chunk)
-                    actual = chunk["actual"]
-                    pred = chunk[pred_col]
-                    actual_num = pd.to_numeric(actual, errors="coerce")
-                    pred_num = pd.to_numeric(pred, errors="coerce")
-                    numeric = actual_num.notna().all() and pred_num.notna().all()
-                    row: dict[str, Any] = {
-                        "method": method,
-                        "group_key": key,
-                        "n_eval_rows": int(n),
-                    }
-                    config_row = method_to_config.get(method)
-                    if config_row:
-                        row["experiment_name"] = config_row.get("experiment_name")
-                        row["model"] = config_row.get("model")
-                        row["selector"] = config_row.get("selector")
-                    if numeric:
-                        err = pred_num - actual_num
-                        row["rmse"] = float(np.sqrt(np.mean(np.square(err))))
-                        row["mae"] = float(np.mean(np.abs(err)))
-                    else:
-                        row["accuracy"] = float((pred == actual).mean())
-                    rows.append(row)
-            if rows:
-                tables["group_performance"] = pd.DataFrame(rows).sort_values(
-                    by=["method", "group_key"]
-                ).reset_index(drop=True)
 
     if payload["warnings"]:
         tables["warnings"] = pd.DataFrame({"warning": payload["warnings"]})
@@ -327,6 +589,9 @@ def summary_text(result: "GroupMLResult", top_n: int = 5) -> str:
             )
 
     lines.append(f"Recommendation: {payload.get('recommendation', '')}")
+    lines.append(
+        f"Recommendation report exports the recommended setup plus top {max(1, int(top_n))} CV-ranked options overall."
+    )
 
     warnings = payload.get("warnings", [])
     if warnings:

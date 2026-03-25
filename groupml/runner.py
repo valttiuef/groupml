@@ -156,14 +156,17 @@ class GroupMLRunner:
         models = normalize_models(self.config.models, task, self.config.random_state)
         selectors = normalize_selectors(self.config.feature_selectors, task)
         model_selector_runs = len(models) * len(selectors)
-        group_permutation_splits = group_column_permutations(group_cols) if group_cols else []
+        has_distinct_group_permutations = len(group_cols) > 1
+        group_permutation_splits = (
+            group_column_permutations(group_cols) if has_distinct_group_permutations else []
+        )
         planned_variants = {
             "full": 1 if "full" in default_experiment_names(self.config) else 0,
             "group_as_features": 1 if "group_as_features" in default_experiment_names(self.config) and group_cols else 0,
             "group_split": 1 if "group_split" in default_experiment_names(self.config) and group_cols else 0,
             "group_permutations": (
                 len(group_permutation_splits)
-                if "group_permutations" in default_experiment_names(self.config) and group_cols
+                if "group_permutations" in default_experiment_names(self.config) and has_distinct_group_permutations
                 else 0
             ),
             "rule_split": 1 if "rule_split" in default_experiment_names(self.config) and parsed_rules else 0,
@@ -264,6 +267,7 @@ class GroupMLRunner:
                 payload={
                     "event": "experiment_completed",
                     "mode": row.get("mode"),
+                    "method_type": row.get("method_type"),
                     "variant": row.get("variant"),
                     "model": row.get("model"),
                     "selector": row.get("selector"),
@@ -349,7 +353,7 @@ class GroupMLRunner:
                 warnings.append("Skipping group_split: no group_columns provided.")
 
         if "group_permutations" in modes:
-            if group_cols:
+            if has_distinct_group_permutations:
                 _emit_mode_started("group_permutations", len(group_permutation_splits))
                 for cols in group_permutation_splits:
                     rows.extend(
@@ -370,6 +374,8 @@ class GroupMLRunner:
                             on_experiment_completed=_mark_experiment_completed,
                         )
                     )
+            elif group_cols:
+                warnings.append("Skipping group_permutations: requires at least two group_columns.")
             else:
                 warnings.append("Skipping group_permutations: no group_columns provided.")
 
@@ -410,7 +416,7 @@ class GroupMLRunner:
                 "Ignored "
                 f"{dropped_rows} unsuccessful experiment(s) with invalid/unstable CV results from ranking and averages."
             )
-        leaderboard = all_rows.loc[valid_mask].sort_values(by=["cv_mean", "test_score"], ascending=False)
+        leaderboard = all_rows.loc[valid_mask].sort_values(by=["cv_mean"], ascending=False)
         leaderboard.reset_index(drop=True, inplace=True)
         if leaderboard.empty:
             raise ValueError(
@@ -495,6 +501,7 @@ class GroupMLRunner:
 
         split_info_payload = dict(split_plan.split_info)
         split_info_payload["scorer"] = str(self.config.scorer)
+        split_info_payload["configured_group_columns"] = list(group_cols)
         return GroupMLResult(
             leaderboard=leaderboard,
             recommendation=recommendation,
@@ -522,13 +529,9 @@ class GroupMLRunner:
             return True
         if candidate_cv < current_cv:
             return False
-        candidate_test = float(candidate.get("test_score", np.nan))
-        current_test = float(current_best.get("test_score", np.nan))
-        if np.isnan(current_test) and not np.isnan(candidate_test):
-            return True
-        if np.isnan(candidate_test) and not np.isnan(current_test):
-            return False
-        return candidate_test > current_test
+        candidate_name = str(candidate.get("experiment_name", ""))
+        current_name = str(current_best.get("experiment_name", ""))
+        return candidate_name < current_name
 
     def _is_rmse_like_scorer(self) -> bool:
         if not isinstance(self.config.scorer, str):
@@ -789,17 +792,13 @@ class GroupMLRunner:
     def _pick_best_rows_by_method(self, leaderboard: pd.DataFrame) -> list[dict[str, Any]]:
         if leaderboard.empty:
             return []
-        ordered = leaderboard.sort_values(by=["cv_mean", "test_score"], ascending=False).copy()
-        one_group = len(list(self.config.group_columns)) == 1
-        has_onehot = (ordered["mode"] == "group_as_features").any()
-        group_aware_modes = {"group_split", "group_permutations", "rule_split"}
-        has_group_aware = ordered["mode"].isin(group_aware_modes).any()
-        if one_group and has_onehot and has_group_aware:
-            onehot_row = ordered[ordered["mode"] == "group_as_features"].head(1)
-            aware_row = ordered[ordered["mode"].isin(group_aware_modes)].head(1)
-            return pd.concat([onehot_row, aware_row], ignore_index=True).to_dict(orient="records")
-
-        best = ordered.drop_duplicates(subset=["experiment_name"], keep="first")
+        ordered = leaderboard.sort_values(by=["cv_mean"], ascending=False).copy()
+        best = ordered.drop_duplicates(subset=["mode"], keep="first")
+        mode_order = ["full", "group_as_features", "group_split", "group_permutations", "rule_split"]
+        order_map = {mode: idx for idx, mode in enumerate(mode_order)}
+        best["__mode_order__"] = best["mode"].map(lambda mode: order_map.get(str(mode), 999))
+        best = best.sort_values(by=["__mode_order__", "cv_mean"], ascending=[True, False])
+        best = best.drop(columns=["__mode_order__"])
         return best.to_dict(orient="records")
 
     def _method_token(self, row: dict[str, Any]) -> str:
@@ -811,15 +810,23 @@ class GroupMLRunner:
             return "method"
         return token[:80]
 
+    def _method_type_for_mode(self, mode: str) -> str:
+        lowered = str(mode).strip().lower()
+        if lowered == "group_as_features":
+            return "one_hot_group_features"
+        if lowered == "group_split":
+            return "per_group_models"
+        if lowered == "group_permutations":
+            return "per_group_models_group_combos"
+        if lowered == "rule_split":
+            return "rule_based_split"
+        if lowered == "full":
+            return "no_group_awareness"
+        return lowered or "method"
+
     def _comparison_label(self, row: dict[str, Any]) -> str:
         mode = str(row.get("mode", "")).strip().lower()
-        if mode == "group_as_features":
-            return "onehot"
-        if mode in {"group_split", "group_permutations", "rule_split"}:
-            return "group_aware"
-        if mode == "full":
-            return "full"
-        return mode or "method"
+        return self._method_type_for_mode(mode)
 
     def _build_best_estimator(
         self,
@@ -978,7 +985,9 @@ class GroupMLRunner:
         warnings: list[str],
     ) -> tuple[pd.DataFrame, list[str]]:
         modes = set(default_experiment_names(self.config))
-        uses_group_split = bool(group_cols) and bool({"group_split", "group_permutations"} & modes)
+        uses_group_split = bool(group_cols) and (
+            ("group_split" in modes) or ("group_permutations" in modes and len(group_cols) > 1)
+        )
         if not uses_group_split:
             return data, feature_cols
 
@@ -1302,6 +1311,7 @@ class GroupMLRunner:
         cv_std = float(np.std(scores, ddof=1)) if len(scores) > 1 else np.nan
         return {
             "mode": mode,
+            "method_type": self._method_type_for_mode(mode),
             "variant": variant,
             "experiment_name": f"{mode}:{variant}",
             "model": model_name,
@@ -1316,7 +1326,7 @@ class GroupMLRunner:
         baseline = leaderboard[leaderboard["mode"] == "full"]
         if baseline.empty:
             baseline = leaderboard.head(1)
-        return baseline.sort_values(by=["cv_mean", "test_score"], ascending=False).iloc[0].to_dict()
+        return baseline.sort_values(by=["cv_mean"], ascending=False).iloc[0].to_dict()
 
     def _recommend(
         self,
