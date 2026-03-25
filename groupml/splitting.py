@@ -283,6 +283,7 @@ def _materialize_holdout(
     split_date_column: str | None,
     split_stratify_column: str | None,
     test_split_strategy: str,
+    warnings: list[str] | None = None,
     test_splitter: Any = None,
 ) -> tuple[np.ndarray, np.ndarray, str]:
     n_samples = len(X)
@@ -320,12 +321,27 @@ def _materialize_holdout(
                 stratify = split_source_df[split_stratify_column]
             elif task == "classification" and y.nunique(dropna=True) > 1:
                 stratify = y
-            train_idx, test_idx = train_test_split(
-                np.arange(n_samples),
-                test_size=n_test,
-                random_state=random_state,
-                stratify=stratify,
-            )
+            try:
+                train_idx, test_idx = train_test_split(
+                    np.arange(n_samples),
+                    test_size=n_test,
+                    random_state=random_state,
+                    stratify=stratify,
+                )
+            except ValueError as exc:
+                if stratify is None:
+                    raise
+                if warnings is not None:
+                    warnings.append(
+                        "Holdout stratification failed; falling back to non-stratified random split. "
+                        f"Reason: {exc}"
+                    )
+                train_idx, test_idx = train_test_split(
+                    np.arange(n_samples),
+                    test_size=n_test,
+                    random_state=random_state,
+                    stratify=None,
+                )
             return (
                 np.asarray(train_idx, dtype=int),
                 np.asarray(test_idx, dtype=int),
@@ -534,30 +550,57 @@ def _build_cv_splits(
         if not cv_stratify_column:
             raise ValueError("stratifycv requires split_stratify_column.")
         splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-        splits = _run_splitter(splitter, X_train, cv_source_train[cv_stratify_column], groups=None)
+        try:
+            splits = _run_splitter(splitter, X_train, cv_source_train[cv_stratify_column], groups=None)
+            strategy_used = "stratifycv"
+            fallback_applied = False
+            fallback_reason = None
+            splitter_name = "StratifiedKFold"
+        except ValueError as exc:
+            warnings.append(
+                "stratifycv could not satisfy class/group frequency constraints; falling back to kfold. "
+                f"Reason: {exc}"
+            )
+            fallback_splitter = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+            splits = _run_splitter(fallback_splitter, X_train, y_train, groups=None)
+            strategy_used = "kfold"
+            fallback_applied = True
+            fallback_reason = "stratification constraints incompatible with requested folds"
+            splitter_name = "KFold"
         meta = {
             "strategy_requested": "stratifycv",
-            "strategy_used": "stratifycv",
+            "strategy_used": strategy_used,
             "uses_groups": False,
             "group_columns": cv_group_columns,
             "date_column": cv_date_column,
             "stratify_column": cv_stratify_column,
-            "fallback_applied": False,
+            "fallback_applied": fallback_applied,
+            "fallback_reason": fallback_reason,
             "inferred_from_columns": inferred_from_columns,
             "fold_size_rows": cv_fold_size_rows,
             "n_splits_derived_from_fold_size": derived_from_fold_size,
         }
-        return splits, "StratifiedKFold", meta
+        return splits, splitter_name, meta
 
     if key in {"stratifygroupcv", "stratifytimecv"}:
         if not cv_stratify_column:
             raise ValueError(f"{selected_cv} requires split_stratify_column.")
         stratify_values = cv_source_train[cv_stratify_column]
-        candidate_splits = _build_hybrid_stratified_splits(
-            n_splits=n_splits,
-            y_stratify=stratify_values,
-            random_state=random_state,
-        )
+        try:
+            candidate_splits = _build_hybrid_stratified_splits(
+                n_splits=n_splits,
+                y_stratify=stratify_values,
+                random_state=random_state,
+            )
+        except ValueError as exc:
+            warnings.append(
+                f"{key} could not build stratified candidate folds; applying non-stratified fallback. Reason: {exc}"
+            )
+            if key == "stratifygroupcv":
+                key = "groupcv"
+            else:
+                key = "timecv"
+            selected_cv = key
 
         if key == "stratifygroupcv":
             group_columns_for_split = list(cv_group_columns or fallback_cv_group_columns)
@@ -740,6 +783,7 @@ def plan_splits(
         split_date_column=resolved_split_date_column,
         split_stratify_column=resolved_split_stratify_column,
         test_split_strategy=test_split_strategy,
+        warnings=split_warnings,
         test_splitter=test_splitter,
     )
     X_train = X.iloc[train_idx]

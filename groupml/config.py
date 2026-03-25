@@ -65,6 +65,7 @@ class GroupMLConfig:
     min_group_size: int = 15
     min_improvement: float = 0.01
     task: Literal["auto", "regression", "classification"] = "auto"
+    warning_verbosity: Literal["quiet", "default", "all"] = "quiet"
 
     def __post_init__(self) -> None:
         if self.test_size_rows is not None:
@@ -111,3 +112,5 @@ class GroupMLConfig:
             raise ValueError("raw_report_enabled must be a boolean.")
         if not isinstance(self.raw_report_max_columns, int) or self.raw_report_max_columns < 1:
             raise ValueError("raw_report_max_columns must be an integer >= 1.")
+        if self.warning_verbosity not in {"quiet", "default", "all"}:
+            raise ValueError("warning_verbosity must be one of: 'quiet', 'default', 'all'.")

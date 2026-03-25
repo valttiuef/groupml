@@ -179,6 +179,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Holdout size value interpreted by --test-size-strategy.",
     )
     parser.add_argument("--random-state", type=int, default=42, help="Random seed.")
+    parser.add_argument(
+        "--warning-verbosity",
+        choices=["quiet", "default", "all"],
+        default="quiet",
+        help=(
+            "Library warning output level. "
+            "'quiet' hides common sklearn/joblib noise, "
+            "'default' shows common warnings once, "
+            "'all' shows all warnings."
+        ),
+    )
     parser.add_argument("--min-group-size", type=int, default=15)
     parser.add_argument("--min-improvement", type=float, default=0.01)
     parser.add_argument("--scale-numeric", action="store_true", help="Scale numeric features.")
@@ -246,6 +257,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         test_size=test_size,
         test_size_rows=test_size_rows,
         random_state=args.random_state,
+        warning_verbosity=args.warning_verbosity,
         min_group_size=args.min_group_size,
         min_improvement=args.min_improvement,
         scale_numeric=args.scale_numeric,
@@ -276,6 +288,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             parsed = abs(parsed)
         return f"{parsed:.5f}"
 
+    def _leaderboard_for_display(leaderboard: pd.DataFrame) -> pd.DataFrame:
+        if not rmse_display or leaderboard.empty:
+            return leaderboard
+        display = leaderboard.copy()
+        for col in ("cv_mean", "test_score"):
+            if col not in display.columns:
+                continue
+            numeric = pd.to_numeric(display[col], errors="coerce")
+            display[col] = numeric.where(~numeric.notna(), numeric.abs())
+        return display
+
     partial_rows: list[dict[str, object]] = []
     partial_warnings: list[str] = []
     partial_split_info: dict[str, object] = {}
@@ -292,6 +315,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             except (TypeError, ValueError):
                 partial_total_experiments = 0
             partial_split_info = {
+                "test": {
+                    "splitter": event.get("test_splitter"),
+                    "strategy": event.get("test_strategy"),
+                    "train_size": event.get("test_train_size"),
+                    "test_size": event.get("test_test_size"),
+                },
                 "cv": {
                     "splitter": event.get("cv_splitter"),
                     "n_splits": event.get("cv_n_splits"),
@@ -305,6 +334,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "inferred_from_columns": event.get("cv_inferred_from_columns"),
                     "fold_size_rows": event.get("cv_fold_size_rows"),
                     "n_splits_derived_from_fold_size": event.get("cv_n_splits_derived_from_fold_size"),
+                    "scorer": event.get("scorer"),
                 }
             }
             return
@@ -324,8 +354,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "model": event.get("model", "unknown"),
                     "selector": event.get("selector", "unknown"),
                     "cv_mean": event.get("cv_mean", float("nan")),
-                    "cv_std": float("nan"),
-                    "cv_folds_ok": float("nan"),
+                    "cv_std": event.get("cv_std", float("nan")),
+                    "cv_folds_ok": event.get("cv_folds_ok", float("nan")),
                     "test_score": event.get("test_score", float("nan")),
                 }
             )
@@ -431,7 +461,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(result.summary_text())
     print()
     print("Leaderboard:")
-    print(result.leaderboard.head(args.top).to_string(index=False))
+    print(_leaderboard_for_display(result.leaderboard).head(args.top).to_string(index=False))
 
     out_path = Path(args.out) if args.out else Path.cwd() / default_summary_filename(ext=".csv")
     saved_path = export_summary(result, out_path, top_n=args.top)

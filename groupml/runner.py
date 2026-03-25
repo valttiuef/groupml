@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import warnings as py_warnings
+from contextlib import contextmanager
 from itertools import product
+import re
 from typing import Any, Callable, Iterable
 
 import numpy as np
 import pandas as pd
 from sklearn.base import clone
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.metrics import get_scorer, mean_squared_error
 from sklearn.pipeline import Pipeline
 
@@ -38,6 +42,28 @@ class GroupMLRunner:
 
     def __init__(self, config: GroupMLConfig) -> None:
         self.config = config
+
+    @contextmanager
+    def _lib_warning_filter(self) -> Iterable[None]:
+        level = str(self.config.warning_verbosity).strip().lower()
+        if level == "all":
+            yield
+            return
+        with py_warnings.catch_warnings():
+            if level == "quiet":
+                py_warnings.filterwarnings(
+                    "ignore",
+                    message=r"`sklearn\.utils\.parallel\.delayed` should be used with `sklearn\.utils\.parallel\.Parallel`.*",
+                    category=UserWarning,
+                )
+                py_warnings.filterwarnings("ignore", category=ConvergenceWarning)
+            else:
+                py_warnings.filterwarnings(
+                    "once",
+                    message=r"`sklearn\.utils\.parallel\.delayed` should be used with `sklearn\.utils\.parallel\.Parallel`.*",
+                    category=UserWarning,
+                )
+            yield
 
     def fit_evaluate(
         self,
@@ -85,6 +111,21 @@ class GroupMLRunner:
             task=task,
             warnings=warnings,
         )
+        data, feature_cols = self._apply_comparability_row_filter(
+            data=data,
+            feature_cols=feature_cols,
+            group_cols=group_cols,
+            warnings=warnings,
+        )
+
+        split_stratify_column, split_group_columns, planned_test_split_strategy = self._resolve_split_defaults(
+            data=data,
+            group_cols=group_cols,
+            split_group_columns=split_group_columns,
+            split_date_column=split_date_column,
+            split_stratify_column=split_stratify_column,
+            warnings=warnings,
+        )
 
         y = data[self.config.target]
 
@@ -104,7 +145,7 @@ class GroupMLRunner:
             split_stratify_column=split_stratify_column,
             fallback_cv_group_columns=group_cols,
             test_splitter=self.config.test_splitter,
-            test_split_strategy=self.config.test_split_strategy,
+            test_split_strategy=planned_test_split_strategy,
             include_indices=self.config.include_split_indices,
             cv_source_df=data,
         )
@@ -165,6 +206,11 @@ class GroupMLRunner:
                 "cv_n_splits_derived_from_fold_size": split_plan.split_info.get("cv", {}).get(
                     "n_splits_derived_from_fold_size"
                 ),
+                "test_splitter": split_plan.split_info.get("test", {}).get("splitter"),
+                "test_strategy": split_plan.split_info.get("test", {}).get("strategy"),
+                "test_train_size": split_plan.split_info.get("test", {}).get("train_size"),
+                "test_test_size": split_plan.split_info.get("test", {}).get("test_size"),
+                "scorer": str(self.config.scorer),
             },
         )
 
@@ -185,7 +231,10 @@ class GroupMLRunner:
             nonlocal completed_experiments, best_so_far_row, best_so_far_raw_report
             completed_experiments += 1
             best_updated = False
-            if self._is_better_experiment_row(row, best_so_far_row):
+            cv_mean_value = float(row.get("cv_mean", np.nan))
+            cv_folds_value = int(row.get("cv_folds_ok", 0) or 0)
+            candidate_is_valid = np.isfinite(cv_mean_value) and cv_folds_value > 0
+            if candidate_is_valid and self._is_better_experiment_row(row, best_so_far_row):
                 best_so_far_row = dict(row)
                 best_updated = True
                 if self.config.raw_report_enabled:
@@ -203,6 +252,7 @@ class GroupMLRunner:
                             y_train=y_train,
                             y_full=y,
                             best_row=best_so_far_row,
+                            best_rows_by_method=[best_so_far_row],
                             warnings=warnings,
                         )
                     except Exception as exc:
@@ -218,6 +268,8 @@ class GroupMLRunner:
                     "model": row.get("model"),
                     "selector": row.get("selector"),
                     "cv_mean": row.get("cv_mean"),
+                    "cv_std": row.get("cv_std"),
+                    "cv_folds_ok": row.get("cv_folds_ok"),
                     "test_score": row.get("test_score"),
                     "completed_experiments": completed_experiments,
                     "total_experiments": total_experiments,
@@ -233,6 +285,7 @@ class GroupMLRunner:
                 self._run_flat_mode(
                     mode="full",
                     variant="all_features",
+                    task=task,
                     X_train=X_train,
                     y_train=y_train,
                     X_test=X_test,
@@ -254,6 +307,7 @@ class GroupMLRunner:
                     self._run_flat_mode(
                         mode="group_as_features",
                         variant="groups_onehot",
+                        task=task,
                         X_train=X_train,
                         y_train=y_train,
                         X_test=X_test,
@@ -277,6 +331,7 @@ class GroupMLRunner:
                     self._run_group_split_mode(
                         mode="group_split",
                         split_columns=tuple(group_cols),
+                        task=task,
                         X_train=X_train,
                         y_train=y_train,
                         X_test=X_test,
@@ -286,7 +341,6 @@ class GroupMLRunner:
                         selectors=selectors,
                         cv_splits=cv_splits,
                         scorer=scorer_callable,
-                        task=task,
                         warnings=warnings,
                         on_experiment_completed=_mark_experiment_completed,
                     )
@@ -302,6 +356,7 @@ class GroupMLRunner:
                         self._run_group_split_mode(
                             mode="group_permutations",
                             split_columns=tuple(cols),
+                            task=task,
                             X_train=X_train,
                             y_train=y_train,
                             X_test=X_test,
@@ -311,7 +366,6 @@ class GroupMLRunner:
                             selectors=selectors,
                             cv_splits=cv_splits,
                             scorer=scorer_callable,
-                            task=task,
                             warnings=warnings,
                             on_experiment_completed=_mark_experiment_completed,
                         )
@@ -326,6 +380,7 @@ class GroupMLRunner:
                     self._run_rule_split_mode(
                         mode="rule_split",
                         parsed_rules=parsed_rules,
+                        task=task,
                         X_train=X_train,
                         y_train=y_train,
                         X_test=X_test,
@@ -335,7 +390,6 @@ class GroupMLRunner:
                         selectors=selectors,
                         cv_splits=cv_splits,
                         scorer=scorer_callable,
-                        task=task,
                         warnings=warnings,
                         on_experiment_completed=_mark_experiment_completed,
                     )
@@ -346,20 +400,49 @@ class GroupMLRunner:
         if not rows:
             raise ValueError("No experiments were executed. Check experiment_modes and inputs.")
 
-        leaderboard = pd.DataFrame(rows).sort_values(
-            by=["cv_mean", "test_score"], ascending=False
+        all_rows = pd.DataFrame(rows)
+        valid_mask = np.isfinite(pd.to_numeric(all_rows["cv_mean"], errors="coerce")) & (
+            pd.to_numeric(all_rows["cv_folds_ok"], errors="coerce") > 0
         )
+        dropped_rows = int((~valid_mask).sum())
+        if dropped_rows:
+            warnings.append(
+                "Ignored "
+                f"{dropped_rows} unsuccessful experiment(s) with invalid/unstable CV results from ranking and averages."
+            )
+        leaderboard = all_rows.loc[valid_mask].sort_values(by=["cv_mean", "test_score"], ascending=False)
         leaderboard.reset_index(drop=True, inplace=True)
+        if leaderboard.empty:
+            raise ValueError(
+                "All experiments were unsuccessful or produced invalid/unstable CV results. "
+                "Try adjusting models/selectors, scaling, or regularization."
+            )
 
         baseline_row = self._pick_baseline(leaderboard)
         best_row = leaderboard.iloc[0].to_dict()
         recommendation = self._recommend(best_row, baseline_row, warnings)
+        best_rows_by_method = self._pick_best_rows_by_method(leaderboard)
         raw_report = pd.DataFrame()
         if self.config.raw_report_enabled:
             try:
                 if not best_so_far_raw_report.empty and best_so_far_row is not None:
                     if best_so_far_row.get("experiment_name") == best_row.get("experiment_name"):
-                        raw_report = best_so_far_raw_report
+                        raw_report = self._build_raw_report(
+                            data=data,
+                            split_plan=split_plan,
+                            task=task,
+                            models=models,
+                            selectors=selectors,
+                            feature_cols=feature_cols,
+                            group_cols=group_cols,
+                            parsed_rules=parsed_rules,
+                            X_train=X_train,
+                            y_train=y_train,
+                            y_full=y,
+                            best_row=best_row,
+                            best_rows_by_method=best_rows_by_method,
+                            warnings=warnings,
+                        )
                     else:
                         raw_report = self._build_raw_report(
                             data=data,
@@ -374,6 +457,7 @@ class GroupMLRunner:
                             y_train=y_train,
                             y_full=y,
                             best_row=best_row,
+                            best_rows_by_method=best_rows_by_method,
                             warnings=warnings,
                         )
                 else:
@@ -390,6 +474,7 @@ class GroupMLRunner:
                         y_train=y_train,
                         y_full=y,
                         best_row=best_row,
+                        best_rows_by_method=best_rows_by_method,
                         warnings=warnings,
                     )
             except Exception as exc:
@@ -408,13 +493,15 @@ class GroupMLRunner:
             },
         )
 
+        split_info_payload = dict(split_plan.split_info)
+        split_info_payload["scorer"] = str(self.config.scorer)
         return GroupMLResult(
             leaderboard=leaderboard,
             recommendation=recommendation,
             warnings=warnings,
             best_experiment=best_row,
             baseline_experiment=baseline_row,
-            split_info=split_plan.split_info,
+            split_info=split_info_payload,
             raw_report=raw_report,
         )
 
@@ -443,6 +530,34 @@ class GroupMLRunner:
             return False
         return candidate_test > current_test
 
+    def _is_rmse_like_scorer(self) -> bool:
+        if not isinstance(self.config.scorer, str):
+            return False
+        scorer_name = self.config.scorer.strip().lower()
+        return scorer_name in {"rmse", "neg_root_mean_squared_error", "root_mean_squared_error"}
+
+    def _is_unstable_score(
+        self,
+        score: float,
+        y_ref: pd.Series,
+        task: str,
+    ) -> bool:
+        if not np.isfinite(score):
+            return True
+        if task != "regression" or not self._is_rmse_like_scorer():
+            return False
+        y_num = pd.to_numeric(y_ref, errors="coerce").to_numpy(dtype=float)
+        finite = y_num[np.isfinite(y_num)]
+        if finite.size == 0:
+            target_scale = 1.0
+        else:
+            p95 = float(np.nanpercentile(np.abs(finite), 95))
+            std = float(np.nanstd(finite))
+            target_scale = max(1.0, p95, std)
+        # RMSE-like score magnitude exploding far beyond target scale usually indicates divergence.
+        rmse_abs_cap = max(1e6, target_scale * 1e6)
+        return abs(score) > rmse_abs_cap
+
     def _build_raw_report(
         self,
         data: pd.DataFrame,
@@ -457,10 +572,135 @@ class GroupMLRunner:
         y_train: pd.Series,
         y_full: pd.Series,
         best_row: dict[str, Any],
+        best_rows_by_method: list[dict[str, Any]] | None,
+        warnings: list[str],
+    ) -> pd.DataFrame:
+        n_rows = len(data)
+        rows_to_render = best_rows_by_method or [best_row]
+        reports_by_method: list[tuple[str, dict[str, Any], pd.DataFrame]] = []
+        for row in rows_to_render:
+            token = self._method_token(row)
+            method_report = self._build_single_experiment_prediction_report(
+                data=data,
+                split_plan=split_plan,
+                task=task,
+                models=models,
+                selectors=selectors,
+                feature_cols=feature_cols,
+                group_cols=group_cols,
+                parsed_rules=parsed_rules,
+                X_train=X_train,
+                y_train=y_train,
+                y_full=y_full,
+                experiment_row=row,
+                warnings=warnings,
+            )
+            reports_by_method.append((token, row, method_report))
+
+        if not reports_by_method:
+            return pd.DataFrame()
+        primary_token = self._method_token(best_row)
+        primary_report = None
+        for token, _, rep in reports_by_method:
+            if token == primary_token:
+                primary_report = rep
+                break
+        if primary_report is None:
+            primary_report = reports_by_method[0][2]
+            primary_token = reports_by_method[0][0]
+
+        report = primary_report.copy()
+        report = report.rename(
+            columns={
+                "predicted": f"predicted_{primary_token}",
+                "error": f"error_{primary_token}",
+            }
+        )
+        report["prediction_method"] = str(best_row.get("experiment_name"))
+        report["predicted"] = report[f"predicted_{primary_token}"]
+        report["error"] = report[f"error_{primary_token}"]
+        for token, row, method_report in reports_by_method:
+            if token == primary_token:
+                continue
+            report = report.join(
+                method_report.set_index("row_index")[["predicted", "error"]].rename(
+                    columns={
+                        "predicted": f"predicted_{token}",
+                        "error": f"error_{token}",
+                    }
+                ),
+                on="row_index",
+            )
+
+        prediction_columns = [c for c in report.columns if c.startswith("predicted_")]
+        error_columns = [c for c in report.columns if c.startswith("error_")]
+        if prediction_columns:
+            eval_mask = report["split_assignment"] != "train"
+            invalid_mask = eval_mask & report[prediction_columns].isna().any(axis=1)
+            dropped_for_comparability = int(invalid_mask.sum())
+            if dropped_for_comparability:
+                report.loc[invalid_mask, prediction_columns + error_columns + ["predicted", "error"]] = np.nan
+                warnings.append(
+                    "Raw report omitted predictions for "
+                    f"{dropped_for_comparability} eval row(s) to keep method comparisons aligned."
+                )
+
+        label_counts: dict[str, int] = {}
+        detailed_prediction_cols = list(prediction_columns)
+        detailed_error_cols = list(error_columns)
+        for token, row, _ in reports_by_method:
+            base_label = self._comparison_label(row)
+            count = label_counts.get(base_label, 0)
+            label_counts[base_label] = count + 1
+            alias = base_label if count == 0 else f"{base_label}_{count + 1}"
+            pred_col = f"predicted_{token}"
+            err_col = f"error_{token}"
+            if pred_col in report.columns:
+                report[f"predicted_{alias}"] = report[pred_col]
+            if err_col in report.columns:
+                report[f"error_{alias}"] = report[err_col]
+        report = report.drop(columns=detailed_prediction_cols + detailed_error_cols, errors="ignore")
+
+        identity_columns = list(
+            dict.fromkeys(
+                list(self.config.split_group_columns or [])
+                + ([self.config.split_group_column] if self.config.split_group_column else [])
+                + ([self.config.split_stratify_column] if self.config.split_stratify_column else [])
+                + ([self.config.split_date_column] if self.config.split_date_column else [])
+                + group_cols
+            )
+        )
+        identity_columns = [c for c in identity_columns if c in data.columns]
+        sample_columns = [c for c in data.columns if c != self.config.target][: self.config.raw_report_max_columns]
+        sample_columns = [c for c in sample_columns if c not in identity_columns]
+
+        ordered_columns = (
+            ["row_index"]
+            + identity_columns
+            + sample_columns
+            + ["split_assignment", "actual", "predicted", "error", "prediction_method"]
+        )
+        extra_columns = [c for c in report.columns if c not in ordered_columns]
+        return report.join(data[identity_columns + sample_columns]).loc[:, ordered_columns + extra_columns]
+
+    def _build_single_experiment_prediction_report(
+        self,
+        data: pd.DataFrame,
+        split_plan: Any,
+        task: str,
+        models: dict[str, Any],
+        selectors: dict[str, Any],
+        feature_cols: list[str],
+        group_cols: list[str],
+        parsed_rules: list[Any],
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        y_full: pd.Series,
+        experiment_row: dict[str, Any],
         warnings: list[str],
     ) -> pd.DataFrame:
         estimator = self._build_best_estimator(
-            best_row=best_row,
+            best_row=experiment_row,
             task=task,
             models=models,
             selectors=selectors,
@@ -469,7 +709,6 @@ class GroupMLRunner:
             parsed_rules=parsed_rules,
             X_train=X_train,
         )
-
         n_rows = len(data)
         per_row_predictions: list[list[Any]] = [[] for _ in range(n_rows)]
         split_labels: list[set[str]] = [set() for _ in range(n_rows)]
@@ -480,10 +719,15 @@ class GroupMLRunner:
             y_tr = y_train.iloc[train_idx]
             X_val = X_train.iloc[val_idx]
             try:
-                fold_estimator.fit(X_tr, y_tr)
-                val_pred = fold_estimator.predict(X_val)
+                with self._lib_warning_filter():
+                    fold_estimator.fit(X_tr, y_tr)
+                    val_pred = fold_estimator.predict(X_val)
             except Exception as exc:
-                warnings.append(f"Raw report CV prediction failure on fold {fold_idx}: {exc}")
+                warnings.append(
+                    f"Raw report CV prediction failure on fold {fold_idx} for "
+                    f"{experiment_row.get('experiment_name')} ({experiment_row.get('model')}, "
+                    f"{experiment_row.get('selector')}): {exc}"
+                )
                 continue
             global_val_idx = split_plan.train_indices[val_idx]
             for idx, pred in zip(global_val_idx, val_pred):
@@ -491,12 +735,20 @@ class GroupMLRunner:
                 split_labels[int(idx)].add(f"cv_{fold_idx}")
 
         fitted = clone(estimator)
-        fitted.fit(X_train, y_train)
         X_test = data[feature_cols].iloc[split_plan.test_indices]
-        test_pred = fitted.predict(X_test)
-        for idx, pred in zip(split_plan.test_indices, test_pred):
-            per_row_predictions[int(idx)].append(pred)
-            split_labels[int(idx)].add("test")
+        try:
+            with self._lib_warning_filter():
+                fitted.fit(X_train, y_train)
+                test_pred = fitted.predict(X_test)
+            for idx, pred in zip(split_plan.test_indices, test_pred):
+                per_row_predictions[int(idx)].append(pred)
+                split_labels[int(idx)].add("test")
+        except Exception as exc:
+            warnings.append(
+                "Raw report test prediction failure for "
+                f"{experiment_row.get('experiment_name')} ({experiment_row.get('model')}, "
+                f"{experiment_row.get('selector')}): {exc}"
+            )
 
         prediction: list[Any] = [np.nan] * n_rows
         for row_idx, values in enumerate(per_row_predictions):
@@ -524,7 +776,6 @@ class GroupMLRunner:
                 "predicted": prediction,
             }
         )
-
         if task == "regression":
             report["error"] = report["predicted"] - report["actual"]
         else:
@@ -533,27 +784,42 @@ class GroupMLRunner:
                 np.nan,
                 (report["predicted"] != report["actual"]).astype(float),
             )
+        return report
 
-        identity_columns = list(
-            dict.fromkeys(
-                list(self.config.split_group_columns or [])
-                + ([self.config.split_group_column] if self.config.split_group_column else [])
-                + ([self.config.split_stratify_column] if self.config.split_stratify_column else [])
-                + ([self.config.split_date_column] if self.config.split_date_column else [])
-                + group_cols
-            )
-        )
-        identity_columns = [c for c in identity_columns if c in data.columns]
-        sample_columns = [c for c in data.columns if c != self.config.target][: self.config.raw_report_max_columns]
-        sample_columns = [c for c in sample_columns if c not in identity_columns]
+    def _pick_best_rows_by_method(self, leaderboard: pd.DataFrame) -> list[dict[str, Any]]:
+        if leaderboard.empty:
+            return []
+        ordered = leaderboard.sort_values(by=["cv_mean", "test_score"], ascending=False).copy()
+        one_group = len(list(self.config.group_columns)) == 1
+        has_onehot = (ordered["mode"] == "group_as_features").any()
+        group_aware_modes = {"group_split", "group_permutations", "rule_split"}
+        has_group_aware = ordered["mode"].isin(group_aware_modes).any()
+        if one_group and has_onehot and has_group_aware:
+            onehot_row = ordered[ordered["mode"] == "group_as_features"].head(1)
+            aware_row = ordered[ordered["mode"].isin(group_aware_modes)].head(1)
+            return pd.concat([onehot_row, aware_row], ignore_index=True).to_dict(orient="records")
 
-        ordered_columns = (
-            ["row_index"]
-            + identity_columns
-            + sample_columns
-            + ["split_assignment", "actual", "predicted", "error"]
-        )
-        return report.join(data[identity_columns + sample_columns]).loc[:, ordered_columns]
+        best = ordered.drop_duplicates(subset=["experiment_name"], keep="first")
+        return best.to_dict(orient="records")
+
+    def _method_token(self, row: dict[str, Any]) -> str:
+        mode = str(row.get("mode", "unknown")).strip().lower()
+        variant = str(row.get("variant", "default")).strip().lower()
+        token = f"{mode}__{variant}"
+        token = re.sub(r"[^a-z0-9]+", "_", token).strip("_")
+        if not token:
+            return "method"
+        return token[:80]
+
+    def _comparison_label(self, row: dict[str, Any]) -> str:
+        mode = str(row.get("mode", "")).strip().lower()
+        if mode == "group_as_features":
+            return "onehot"
+        if mode in {"group_split", "group_permutations", "rule_split"}:
+            return "group_aware"
+        if mode == "full":
+            return "full"
+        return mode or "method"
 
     def _build_best_estimator(
         self,
@@ -704,6 +970,77 @@ class GroupMLRunner:
         task = infer_task(data[self.config.target], self.config.task)
         return data, feature_cols, task
 
+    def _apply_comparability_row_filter(
+        self,
+        data: pd.DataFrame,
+        feature_cols: list[str],
+        group_cols: list[str],
+        warnings: list[str],
+    ) -> tuple[pd.DataFrame, list[str]]:
+        modes = set(default_experiment_names(self.config))
+        uses_group_split = bool(group_cols) and bool({"group_split", "group_permutations"} & modes)
+        if not uses_group_split:
+            return data, feature_cols
+
+        by: Any = group_cols[0] if len(group_cols) == 1 else group_cols
+        group_sizes = data.groupby(by, dropna=False).size()
+        if group_sizes.empty:
+            return data, feature_cols
+        valid_groups = set(group_sizes[group_sizes >= int(self.config.min_group_size)].index.tolist())
+        if len(valid_groups) == len(group_sizes):
+            return data, feature_cols
+
+        if len(group_cols) == 1:
+            valid_mask = data[group_cols[0]].isin(valid_groups).to_numpy()
+        else:
+            row_keys = data[group_cols].apply(lambda row: tuple(row.values.tolist()), axis=1)
+            valid_mask = row_keys.isin(valid_groups).to_numpy()
+        dropped = int((~valid_mask).sum())
+        if dropped <= 0:
+            return data, feature_cols
+        filtered = data.loc[valid_mask].copy()
+        warnings.append(
+            "Dropped "
+            f"{dropped} row(s) with group combination size < min_group_size={self.config.min_group_size} "
+            "to keep strategy comparisons on the same usable rows."
+        )
+        if filtered.empty:
+            raise ValueError("No rows left after group comparability filtering.")
+        return filtered, feature_cols
+
+    def _resolve_split_defaults(
+        self,
+        data: pd.DataFrame,
+        group_cols: list[str],
+        split_group_columns: list[str],
+        split_date_column: str | None,
+        split_stratify_column: str | None,
+        warnings: list[str],
+    ) -> tuple[str | None, list[str], str]:
+        resolved_split_stratify = split_stratify_column
+        resolved_test_split_strategy = self.config.test_split_strategy
+        can_auto_stratify = (
+            resolved_split_stratify is None
+            and isinstance(self.config.cv, int)
+            and split_date_column is None
+            and self.config.test_splitter is None
+        )
+        stratify_source_columns = list(split_group_columns or group_cols)
+        if can_auto_stratify and stratify_source_columns:
+            auto_col = "__groupml_auto_stratify__"
+            if len(stratify_source_columns) == 1:
+                data[auto_col] = data[stratify_source_columns[0]].astype(str)
+            else:
+                data[auto_col] = data[stratify_source_columns].astype(str).agg("||".join, axis=1)
+            resolved_split_stratify = auto_col
+            if resolved_test_split_strategy == "last_rows":
+                resolved_test_split_strategy = "random"
+            warnings.append(
+                "Auto-enabled stratification using group columns "
+                f"{stratify_source_columns} for holdout and CV because no split_stratify_column/cv strategy was set."
+            )
+        return resolved_split_stratify, split_group_columns, resolved_test_split_strategy
+
     def _emit_callbacks(
         self,
         callbacks: list[Callable[[dict[str, Any]], None]],
@@ -745,6 +1082,7 @@ class GroupMLRunner:
         self,
         mode: str,
         variant: str,
+        task: str,
         X_train: pd.DataFrame,
         y_train: pd.Series,
         X_test: pd.DataFrame,
@@ -778,6 +1116,7 @@ class GroupMLRunner:
                 y_test=y_test,
                 cv_splits=cv_splits,
                 scorer=scorer,
+                task=task,
                 warnings=warnings,
             )
             rows.append(row)
@@ -789,6 +1128,7 @@ class GroupMLRunner:
         self,
         mode: str,
         split_columns: tuple[str, ...],
+        task: str,
         X_train: pd.DataFrame,
         y_train: pd.Series,
         X_test: pd.DataFrame,
@@ -798,7 +1138,6 @@ class GroupMLRunner:
         selectors: dict[str, Any],
         cv_splits: list[tuple[np.ndarray, np.ndarray]],
         scorer: Callable[[Any, pd.DataFrame, pd.Series], float],
-        task: str,
         warnings: list[str],
         on_experiment_completed: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
@@ -837,6 +1176,7 @@ class GroupMLRunner:
                 y_test=y_test,
                 cv_splits=cv_splits,
                 scorer=scorer,
+                task=task,
                 warnings=warnings,
             )
             rows.append(row)
@@ -848,6 +1188,7 @@ class GroupMLRunner:
         self,
         mode: str,
         parsed_rules: list[Any],
+        task: str,
         X_train: pd.DataFrame,
         y_train: pd.Series,
         X_test: pd.DataFrame,
@@ -857,7 +1198,6 @@ class GroupMLRunner:
         selectors: dict[str, Any],
         cv_splits: list[tuple[np.ndarray, np.ndarray]],
         scorer: Callable[[Any, pd.DataFrame, pd.Series], float],
-        task: str,
         warnings: list[str],
         on_experiment_completed: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
@@ -897,6 +1237,7 @@ class GroupMLRunner:
                 y_test=y_test,
                 cv_splits=cv_splits,
                 scorer=scorer,
+                task=task,
                 warnings=warnings,
             )
             rows.append(row)
@@ -917,6 +1258,7 @@ class GroupMLRunner:
         y_test: pd.Series,
         cv_splits: Iterable[tuple[np.ndarray, np.ndarray]],
         scorer: Callable[[Any, pd.DataFrame, pd.Series], float],
+        task: str,
         warnings: list[str],
     ) -> dict[str, Any]:
         scores: list[float] = []
@@ -925,8 +1267,15 @@ class GroupMLRunner:
             X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
             y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
             try:
-                fold_est.fit(X_tr, y_tr)
-                score = scorer(fold_est, X_val, y_val)
+                with self._lib_warning_filter():
+                    fold_est.fit(X_tr, y_tr)
+                    score = float(scorer(fold_est, X_val, y_val))
+                if self._is_unstable_score(score, y_val, task):
+                    warnings.append(
+                        f"CV failure in {mode}/{variant} ({model_name}, {selector_name}) fold={fold_idx}: "
+                        f"invalid or unstable score={score:.6g}; treated as unsuccessful."
+                    )
+                    continue
                 scores.append(score)
             except Exception as exc:
                 warnings.append(
@@ -935,8 +1284,16 @@ class GroupMLRunner:
         fit_est = clone(estimator)
         test_score = np.nan
         try:
-            fit_est.fit(X_train, y_train)
-            test_score = scorer(fit_est, X_test, y_test)
+            with self._lib_warning_filter():
+                fit_est.fit(X_train, y_train)
+                test_candidate = float(scorer(fit_est, X_test, y_test))
+            if self._is_unstable_score(test_candidate, y_test, task):
+                warnings.append(
+                    f"Test failure in {mode}/{variant} ({model_name}, {selector_name}): "
+                    f"invalid or unstable score={test_candidate:.6g}; treated as unsuccessful."
+                )
+            else:
+                test_score = test_candidate
             if hasattr(fit_est, "warnings_"):
                 warnings.extend(getattr(fit_est, "warnings_"))
         except Exception as exc:

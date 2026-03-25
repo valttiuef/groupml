@@ -4,9 +4,32 @@ import warnings
 
 import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator, RegressorMixin
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import LinearRegression
 
 from groupml import GroupMLConfig, GroupMLRunner
+
+
+class _ConvergenceWarningModel(BaseEstimator, RegressorMixin):
+    def fit(self, X, y):  # type: ignore[no-untyped-def]
+        del X
+        warnings.warn("synthetic convergence warning", ConvergenceWarning)
+        self.mean_ = float(np.mean(y))
+        return self
+
+    def predict(self, X):  # type: ignore[no-untyped-def]
+        return np.full(shape=(len(X),), fill_value=self.mean_, dtype=float)
+
+
+class _ExplodingPredictionModel(BaseEstimator, RegressorMixin):
+    def fit(self, X, y):  # type: ignore[no-untyped-def]
+        del X, y
+        self.constant_ = 1e20
+        return self
+
+    def predict(self, X):  # type: ignore[no-untyped-def]
+        return np.full(shape=(len(X),), fill_value=self.constant_, dtype=float)
 
 
 def test_base_preprocessing_applies_target_range_dropna_and_static_removal() -> None:
@@ -131,3 +154,74 @@ def test_kbest_f_regression_avoids_sparse_invalid_sqrt_warning() -> None:
     messages = [str(item.message) for item in caught]
     assert not any("invalid value encountered in sqrt" in msg for msg in messages)
     assert not result.leaderboard.empty
+
+
+def test_default_warning_verbosity_suppresses_convergence_warning() -> None:
+    n = 50
+    x = np.linspace(0.0, 10.0, n)
+    df = pd.DataFrame({"x": x, "Target": 2.0 * x + 1.0})
+
+    config = GroupMLConfig(
+        target="Target",
+        experiment_modes=["full"],
+        models=[_ConvergenceWarningModel()],
+        feature_selectors=["none"],
+        cv=3,
+        random_state=42,
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", ConvergenceWarning)
+        result = GroupMLRunner(config).fit_evaluate(df)
+
+    assert not result.leaderboard.empty
+    assert not any(isinstance(item.message, ConvergenceWarning) for item in caught)
+
+
+def test_warning_verbosity_all_allows_convergence_warning() -> None:
+    n = 50
+    x = np.linspace(0.0, 10.0, n)
+    df = pd.DataFrame({"x": x, "Target": 2.0 * x + 1.0})
+
+    config = GroupMLConfig(
+        target="Target",
+        experiment_modes=["full"],
+        models=[_ConvergenceWarningModel()],
+        feature_selectors=["none"],
+        cv=3,
+        random_state=42,
+        warning_verbosity="all",
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", ConvergenceWarning)
+        result = GroupMLRunner(config).fit_evaluate(df)
+
+    assert not result.leaderboard.empty
+    assert any(isinstance(item.message, ConvergenceWarning) for item in caught)
+
+
+def test_unstable_rmse_runs_are_ignored_from_leaderboard_and_averages() -> None:
+    n = 80
+    x = np.linspace(0.0, 10.0, n)
+    df = pd.DataFrame({"x": x, "Target": 3.0 * x + 1.0})
+
+    config = GroupMLConfig(
+        target="Target",
+        experiment_modes=["full"],
+        models={
+            "linear": LinearRegression(),
+            "exploding": _ExplodingPredictionModel(),
+        },
+        feature_selectors=["none"],
+        scorer="rmse",
+        cv=4,
+        random_state=42,
+    )
+    result = GroupMLRunner(config).fit_evaluate(df)
+
+    assert not result.leaderboard.empty
+    assert "exploding" not in set(result.leaderboard["model"].tolist())
+    joined_warnings = " | ".join(result.warnings)
+    assert "invalid or unstable score" in joined_warnings
+    assert "Ignored 1 unsuccessful experiment" in joined_warnings

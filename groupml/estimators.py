@@ -65,11 +65,15 @@ class GroupSplitEstimator(BaseEstimator):
         fallback_mask = np.ones(len(X), dtype=bool)
         for key, idx in _groupby_view(X, self.split_columns).groups.items():
             key_tuple = key if isinstance(key, tuple) else (key,)
-            idx_array = np.asarray(list(idx))
+            idx_labels = list(idx)
+            idx_pos = X.index.get_indexer(idx_labels)
+            idx_pos = idx_pos[idx_pos >= 0]
+            if idx_pos.size == 0:
+                continue
             model = self.models_.get(key_tuple)
             if model is not None:
-                predictions[idx_array] = model.predict(X.iloc[idx_array])
-                fallback_mask[idx_array] = False
+                predictions[idx_pos] = model.predict(X.loc[idx_labels])
+                fallback_mask[idx_pos] = False
         if fallback_mask.any():
             predictions[fallback_mask] = self.fallback_model_.predict(X.loc[fallback_mask])
         return predictions

@@ -76,6 +76,8 @@ def test_cli_main_parses_arguments(monkeypatch) -> None:
             "mutual_info",
             "--cv",
             "3",
+            "--warning-verbosity",
+            "all",
             "--sheet-name",
             "SheetA",
         ]
@@ -92,6 +94,7 @@ def test_cli_main_parses_arguments(monkeypatch) -> None:
     assert cfg.models == "trees"
     assert cfg.feature_selectors == "mutual_info"
     assert cfg.cv == 3
+    assert cfg.warning_verbosity == "all"
     assert cfg.cv_fold_size_rows is None
     assert cfg.test_split_strategy == "last_rows"
     assert cfg.test_size == 0.15
@@ -153,6 +156,7 @@ def test_cli_main_parses_cv_fold_size_rows(monkeypatch) -> None:
     cfg = captured["config"]
     assert isinstance(cfg, GroupMLConfig)
     assert cfg.cv_fold_size_rows == 36
+    assert cfg.warning_verbosity == "quiet"
 
 
 def test_cli_main_parses_cv_columns(monkeypatch) -> None:
@@ -663,6 +667,11 @@ def test_cli_progress_callback_prints_positive_rmse(monkeypatch, capsys) -> None
     stdout = capsys.readouterr().out
     assert "cv_rmse=1.23456" in stdout
     assert "test_rmse=2.34567" in stdout
+    leaderboard_section = stdout.split("Leaderboard:", maxsplit=1)[1]
+    assert "1.23456" in leaderboard_section
+    assert "2.34567" in leaderboard_section
+    assert "-1.23456" not in leaderboard_section
+    assert "-2.34567" not in leaderboard_section
 
 
 def test_cli_main_exports_partial_outputs_on_keyboard_interrupt(monkeypatch, tmp_path: Path) -> None:
@@ -689,6 +698,10 @@ def test_cli_main_exports_partial_outputs_on_keyboard_interrupt(monkeypatch, tmp
                     "cv_splitter": "KFold",
                     "cv_strategy_used": "kfold",
                     "cv_n_splits": 3,
+                    "test_splitter": "last_rows",
+                    "test_strategy": "last_rows",
+                    "test_train_size": 80,
+                    "test_test_size": 20,
                 }
             )
             callback(
@@ -701,6 +714,8 @@ def test_cli_main_exports_partial_outputs_on_keyboard_interrupt(monkeypatch, tmp
                     "model": "linear",
                     "selector": "none",
                     "cv_mean": 0.85,
+                    "cv_std": 0.05,
+                    "cv_folds_ok": 3,
                     "test_score": 0.8,
                     "best_so_far_updated": True,
                     "best_raw_report": pd.DataFrame(
@@ -781,3 +796,7 @@ def test_cli_main_exports_partial_outputs_on_keyboard_interrupt(monkeypatch, tmp
     assert "Run interrupted" in partial_result.recommendation
     assert isinstance(partial_result.raw_report, pd.DataFrame)
     assert not partial_result.raw_report.empty
+    assert partial_result.leaderboard.iloc[0]["cv_std"] == 0.05
+    assert partial_result.leaderboard.iloc[0]["cv_folds_ok"] == 3
+    assert partial_result.split_info["test"]["splitter"] == "last_rows"
+    assert partial_result.split_info["test"]["train_size"] == 80
