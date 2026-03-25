@@ -7,6 +7,8 @@ import math
 from pathlib import Path
 from typing import Sequence
 
+import pandas as pd
+
 from .config import GroupMLConfig
 from .file_utils import (
     default_summary_filename,
@@ -14,6 +16,7 @@ from .file_utils import (
     export_summary,
     fit_evaluate_file,
 )
+from .result import GroupMLResult
 
 
 def _parse_cv_value(raw: str) -> int | str:
@@ -249,6 +252,57 @@ def main(argv: Sequence[str] | None = None) -> int:
             parsed = abs(parsed)
         return f"{parsed:.5f}"
 
+    partial_rows: list[dict[str, object]] = []
+    partial_warnings: list[str] = []
+    partial_split_info: dict[str, object] = {}
+    partial_total_experiments = 0
+    partial_completed_experiments = 0
+
+    def _capture_progress_callback(event: dict[str, object]) -> None:
+        nonlocal partial_total_experiments, partial_completed_experiments, partial_split_info
+        event_name = event.get("event")
+        if event_name == "run_started":
+            try:
+                partial_total_experiments = int(event.get("total_experiments", 0))
+            except (TypeError, ValueError):
+                partial_total_experiments = 0
+            partial_split_info = {
+                "cv": {
+                    "splitter": event.get("cv_splitter"),
+                    "n_splits": event.get("cv_n_splits"),
+                    "strategy_used": event.get("cv_strategy_used"),
+                    "strategy_requested": event.get("cv_strategy_requested"),
+                    "fallback_applied": event.get("cv_fallback_applied"),
+                    "fallback_reason": event.get("cv_fallback_reason"),
+                    "group_columns": event.get("split_group_columns"),
+                    "date_column": event.get("split_date_column"),
+                    "stratify_column": event.get("split_stratify_column"),
+                    "inferred_from_columns": event.get("cv_inferred_from_columns"),
+                }
+            }
+            return
+        if event_name == "experiment_completed":
+            try:
+                partial_completed_experiments = int(event.get("completed_experiments", partial_completed_experiments))
+            except (TypeError, ValueError):
+                pass
+            mode = str(event.get("mode", "unknown"))
+            variant = str(event.get("variant", ""))
+            experiment_name = f"{mode}:{variant}" if variant else mode
+            partial_rows.append(
+                {
+                    "mode": mode,
+                    "variant": variant,
+                    "experiment_name": experiment_name,
+                    "model": event.get("model", "unknown"),
+                    "selector": event.get("selector", "unknown"),
+                    "cv_mean": event.get("cv_mean", float("nan")),
+                    "cv_std": float("nan"),
+                    "cv_folds_ok": float("nan"),
+                    "test_score": event.get("test_score", float("nan")),
+                }
+            )
+
     def _cli_progress_callback(event: dict[str, object]) -> None:
         event_name = event.get("event")
         if event_name == "run_started":
@@ -289,8 +343,51 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"| cv_score={cv_mean} | test_score={test_score}"
                 )
 
-    result = fit_evaluate_file(args.path, config, callbacks=[_cli_progress_callback], **read_kwargs)
+    def _combined_progress_callback(event: dict[str, object]) -> None:
+        _capture_progress_callback(event)
+        _cli_progress_callback(event)
 
+    result: GroupMLResult | None = None
+    interrupted = False
+    callbacks = [_combined_progress_callback]
+    try:
+        result = fit_evaluate_file(args.path, config, callbacks=callbacks, **read_kwargs)
+    except KeyboardInterrupt:
+        interrupted = True
+        partial_warnings.append(
+            "Run interrupted by user. Report contains only experiments completed before interruption."
+        )
+        leaderboard = pd.DataFrame(partial_rows)
+        if not leaderboard.empty:
+            leaderboard = leaderboard.sort_values(by=["cv_mean", "test_score"], ascending=False).reset_index(drop=True)
+            best = leaderboard.iloc[0].to_dict()
+            baseline_rows = leaderboard[leaderboard["mode"] == "full"]
+            baseline = (
+                baseline_rows.sort_values(by=["cv_mean", "test_score"], ascending=False).iloc[0].to_dict()
+                if not baseline_rows.empty
+                else best
+            )
+        else:
+            best = {}
+            baseline = {}
+        progress_note = (
+            f"Completed {partial_completed_experiments}/{partial_total_experiments} experiments before interruption."
+        )
+        partial_warnings.append(progress_note)
+        result = GroupMLResult(
+            leaderboard=leaderboard,
+            recommendation=f"Run interrupted. {progress_note}",
+            warnings=partial_warnings,
+            best_experiment=best,
+            baseline_experiment=baseline,
+            split_info=partial_split_info,
+        )
+        print()
+        print(
+            f"[groupml] Interrupted. {progress_note} Attempting to export partial outputs."
+        )
+
+    assert result is not None
     print(result.summary_text())
     print()
     print("Leaderboard:")
@@ -305,4 +402,4 @@ def main(argv: Sequence[str] | None = None) -> int:
         leaderboard_path = export_report(result, Path(args.leaderboard_out))
         print(f"Saved leaderboard: {leaderboard_path}")
 
-    return 0
+    return 130 if interrupted else 0

@@ -609,3 +609,92 @@ def test_cli_progress_callback_prints_positive_rmse(monkeypatch, capsys) -> None
     stdout = capsys.readouterr().out
     assert "cv_rmse=1.23456" in stdout
     assert "test_rmse=2.34567" in stdout
+
+
+def test_cli_main_exports_partial_outputs_on_keyboard_interrupt(monkeypatch, tmp_path: Path) -> None:
+    from groupml import cli
+
+    captured: dict[str, object] = {}
+    summary_out = tmp_path / "partial_summary.csv"
+    leaderboard_out = tmp_path / "partial_leaderboard.csv"
+
+    def _fake_fit_evaluate_file(
+        path: str,
+        config: GroupMLConfig,
+        callbacks: object = None,
+        **read_kwargs: object,
+    ) -> GroupMLResult:
+        del path, config, read_kwargs
+        assert isinstance(callbacks, list)
+        for callback in callbacks:
+            callback(
+                {
+                    "event": "run_started",
+                    "total_experiments": 5,
+                    "cv_splitter": "KFold",
+                    "cv_strategy_used": "kfold",
+                    "cv_n_splits": 3,
+                }
+            )
+            callback(
+                {
+                    "event": "experiment_completed",
+                    "completed_experiments": 1,
+                    "total_experiments": 5,
+                    "mode": "full",
+                    "variant": "all_features",
+                    "model": "linear",
+                    "selector": "none",
+                    "cv_mean": 0.85,
+                    "test_score": 0.8,
+                }
+            )
+        raise KeyboardInterrupt()
+
+    def _fake_export_summary(
+        result: GroupMLResult,
+        path: str | Path,
+        top_n: int = 10,
+        sheet_name: str = "summary",
+    ) -> Path:
+        del top_n, sheet_name
+        captured["summary_result"] = result
+        captured["summary_export_path"] = Path(path)
+        return Path(path)
+
+    def _fake_export_report(
+        result: GroupMLResult,
+        path: str | Path,
+        sheet_name: str = "leaderboard",
+    ) -> Path:
+        del sheet_name
+        captured["report_result"] = result
+        captured["report_export_path"] = Path(path)
+        return Path(path)
+
+    monkeypatch.setattr(cli, "fit_evaluate_file", _fake_fit_evaluate_file)
+    monkeypatch.setattr(cli, "export_summary", _fake_export_summary)
+    monkeypatch.setattr(cli, "export_report", _fake_export_report)
+
+    exit_code = cli.main(
+        [
+            "--path",
+            "data.csv",
+            "--target",
+            "Target",
+            "--out",
+            str(summary_out),
+            "--leaderboard-out",
+            str(leaderboard_out),
+        ]
+    )
+
+    assert exit_code == 130
+    assert captured["summary_export_path"] == summary_out
+    assert captured["report_export_path"] == leaderboard_out
+
+    partial_result = captured["summary_result"]
+    assert isinstance(partial_result, GroupMLResult)
+    assert len(partial_result.leaderboard) == 1
+    assert partial_result.leaderboard.iloc[0]["experiment_name"] == "full:all_features"
+    assert "Run interrupted" in partial_result.recommendation
