@@ -240,10 +240,16 @@ def summary_text(result: "GroupMLResult", top_n: int = 5) -> str:
     if split_info:
         test_info = split_info.get("test", {})
         cv_info = split_info.get("cv", {})
+        cv_extra: list[str] = []
+        if cv_info.get("fold_size_rows") is not None:
+            cv_extra.append(f"fold_size_rows={cv_info.get('fold_size_rows')}")
+        if cv_info.get("n_splits_derived_from_fold_size"):
+            cv_extra.append("n_splits_derived_from_fold_size=True")
+        extra_text = f", {', '.join(cv_extra)}" if cv_extra else ""
         lines.append(
             "Splits: "
             f"test={test_info.get('splitter')} (train={test_info.get('train_size')}, test={test_info.get('test_size')}), "
-            f"cv={cv_info.get('splitter')} (folds={cv_info.get('n_splits')})"
+            f"cv={cv_info.get('splitter')} (folds={cv_info.get('n_splits')}{extra_text})"
         )
 
     return "\n".join(lines)

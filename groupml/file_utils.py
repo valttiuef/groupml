@@ -104,6 +104,36 @@ def export_report(
     )
 
 
+def export_raw_report(
+    result: GroupMLResult,
+    path: str | Path,
+    sheet_name: str = "raw_report",
+) -> Path:
+    """Export raw per-row report to CSV or Excel based on file extension."""
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    suffix = output_path.suffix.lower()
+    raw_df = result.raw_report if isinstance(result.raw_report, pd.DataFrame) else pd.DataFrame()
+
+    if suffix == ".csv":
+        raw_df.to_csv(output_path, index=False)
+        return output_path
+
+    if suffix in {".xls", ".xlsx"}:
+        try:
+            raw_df.to_excel(output_path, index=False, sheet_name=sheet_name)
+        except ImportError as exc:
+            raise ImportError(
+                "Excel export requires an Excel writer engine (for example openpyxl). "
+                "Install it or export as .csv."
+            ) from exc
+        return output_path
+
+    raise ValueError(
+        f"Unsupported raw report extension '{output_path.suffix}'. Supported: .csv, .xls, .xlsx"
+    )
+
+
 def export_summary(
     result: GroupMLResult,
     path: str | Path,

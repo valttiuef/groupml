@@ -53,6 +53,19 @@ GROUP_REQUIRED_SPLITTERS = {
     "leavepgroupsout",
 }
 
+NSPLITS_PARAM_SPLITTER_KEYS = {
+    "kfold",
+    "stratifiedkfold",
+    "groupkfold",
+    "stratifiedgroupkfold",
+    "timeseriessplit",
+    "repeatedkfold",
+    "repeatedstratifiedkfold",
+    "shufflesplit",
+    "stratifiedshufflesplit",
+    "groupshufflesplit",
+}
+
 
 @dataclass(slots=True)
 class SplitPlan:
@@ -99,18 +112,42 @@ class PrecomputedSplitter:
 class DateTimeSeriesSplitter:
     """Time-series splitter that first sorts rows by a provided datetime-like series."""
 
-    def __init__(self, date_values: pd.Series, n_splits: int) -> None:
-        if n_splits < 2:
-            raise ValueError("n_splits must be >= 2 for time-series CV.")
+    def __init__(self, date_values: pd.Series, n_splits: int, test_size: int | None = None) -> None:
+        if n_splits < 1:
+            raise ValueError("n_splits must be >= 1 for time-series CV.")
+        if test_size is not None and test_size < 1:
+            raise ValueError("test_size must be >= 1 when provided for time-series CV.")
         datetimes = pd.to_datetime(date_values, errors="coerce")
         if datetimes.isna().any():
             raise ValueError("split_date_column contains invalid datetime values.")
         self._ordered_idx = np.argsort(datetimes.to_numpy(), kind="mergesort")
-        self._base = TimeSeriesSplit(n_splits=n_splits)
+        self._n_splits = int(n_splits)
+        self._test_size = int(test_size) if test_size is not None else None
+        self._base: TimeSeriesSplit | None = None
+        if self._n_splits > 1:
+            kwargs: dict[str, Any] = {"n_splits": self._n_splits}
+            if self._test_size is not None:
+                kwargs["test_size"] = self._test_size
+            self._base = TimeSeriesSplit(**kwargs)
 
     def split(self, X: Any, y: Any = None, groups: Any = None) -> Any:
         del X, y, groups
         n_samples = len(self._ordered_idx)
+        if self._n_splits == 1:
+            val_size = self._test_size if self._test_size is not None else max(1, n_samples // 2)
+            if val_size >= n_samples:
+                raise ValueError(
+                    f"Single-fold time CV needs train rows before validation. Got n_samples={n_samples}, "
+                    f"val_size={val_size}."
+                )
+            train_sorted = np.arange(0, n_samples - val_size, dtype=int)
+            val_sorted = np.arange(n_samples - val_size, n_samples, dtype=int)
+            train_idx = self._ordered_idx[train_sorted]
+            val_idx = self._ordered_idx[val_sorted]
+            yield np.asarray(train_idx, dtype=int), np.asarray(val_idx, dtype=int)
+            return
+
+        assert self._base is not None
         ordered_positions = np.arange(n_samples)
         for train_sorted, val_sorted in self._base.split(ordered_positions):
             train_idx = self._ordered_idx[train_sorted]
@@ -338,6 +375,49 @@ def _resolve_n_splits(cv: Any, cv_params: dict[str, Any], default: int = 5) -> i
     return int(value)
 
 
+def _is_time_strategy_key(key: str) -> bool:
+    return key in {"timecv", "stratifytimecv", "timeseriessplit"}
+
+
+def _resolve_cv_fold_parameters(
+    *,
+    cv: Any,
+    cv_params: dict[str, Any],
+    selected_key: str,
+    n_train_rows: int,
+    cv_fold_size_rows: int | None,
+) -> tuple[int, int | None, bool]:
+    n_splits = _resolve_n_splits(cv, cv_params, default=5)
+    time_test_size_rows: int | None = None
+    derived_from_fold_size = False
+
+    if cv_fold_size_rows is None:
+        return n_splits, time_test_size_rows, derived_from_fold_size
+    if not isinstance(cv, (int, str, dict)):
+        return n_splits, time_test_size_rows, derived_from_fold_size
+
+    fold_size = int(cv_fold_size_rows)
+    if _is_time_strategy_key(selected_key):
+        time_test_size_rows = fold_size
+        required_rows = n_splits * fold_size
+        if required_rows >= n_train_rows:
+            raise ValueError(
+                "cv_fold_size_rows is too large for time CV. "
+                f"Need n_train_rows > n_splits * cv_fold_size_rows ({n_train_rows} <= {required_rows})."
+            )
+        return n_splits, time_test_size_rows, derived_from_fold_size
+
+    resolved = int(n_train_rows // fold_size)
+    if resolved < 2:
+        raise ValueError(
+            "cv_fold_size_rows is too large for non-time CV. "
+            f"Need at least 2 folds, but only {resolved} fold(s) fit into {n_train_rows} rows."
+        )
+    n_splits = min(resolved, max(2, n_train_rows - 1))
+    derived_from_fold_size = True
+    return n_splits, time_test_size_rows, derived_from_fold_size
+
+
 def _is_valid_group_split(train_idx: np.ndarray, val_idx: np.ndarray, groups: np.ndarray) -> bool:
     train_groups = set(groups[train_idx].tolist())
     val_groups = set(groups[val_idx].tolist())
@@ -377,6 +457,7 @@ def _build_cv_splits(
     cv_date_column: str | None,
     cv_stratify_column: str | None,
     cv_source_train: pd.DataFrame,
+    cv_fold_size_rows: int | None,
     warnings: list[str],
 ) -> tuple[list[tuple[np.ndarray, np.ndarray]], str, dict[str, Any]]:
     selected_cv = _infer_column_driven_cv(
@@ -388,9 +469,20 @@ def _build_cv_splits(
     inferred_from_columns = selected_cv != cv and isinstance(cv, int)
 
     key = _canonical_name(selected_cv) if isinstance(selected_cv, str) else ""
-    n_splits = _resolve_n_splits(cv, cv_params, default=5)
+    n_splits, time_test_size_rows, derived_from_fold_size = _resolve_cv_fold_parameters(
+        cv=cv,
+        cv_params=cv_params,
+        selected_key=key,
+        n_train_rows=len(X_train),
+        cv_fold_size_rows=cv_fold_size_rows,
+    )
     if "n_splits" not in cv_params and isinstance(cv, int):
         cv_params = {**cv_params, "n_splits": int(cv)}
+    if derived_from_fold_size:
+        warnings.append(
+            f"Resolved non-time CV n_splits={n_splits} from cv_fold_size_rows={cv_fold_size_rows} "
+            f"and train_rows={len(X_train)}."
+        )
 
     if key == "groupcv":
         group_columns_for_split = list(cv_group_columns or fallback_cv_group_columns)
@@ -410,13 +502,19 @@ def _build_cv_splits(
             "stratify_column": cv_stratify_column,
             "fallback_applied": False,
             "inferred_from_columns": inferred_from_columns,
+            "fold_size_rows": cv_fold_size_rows,
+            "n_splits_derived_from_fold_size": derived_from_fold_size,
         }
         return splits, "GroupKFold", meta
 
     if key == "timecv":
         if not cv_date_column:
             raise ValueError("timecv requires split_date_column.")
-        splitter = DateTimeSeriesSplitter(cv_source_train[cv_date_column], n_splits=n_splits)
+        splitter = DateTimeSeriesSplitter(
+            cv_source_train[cv_date_column],
+            n_splits=n_splits,
+            test_size=time_test_size_rows,
+        )
         splits = _run_splitter(splitter, X_train, y_train, groups=None)
         meta = {
             "strategy_requested": "timecv",
@@ -427,6 +525,8 @@ def _build_cv_splits(
             "stratify_column": cv_stratify_column,
             "fallback_applied": False,
             "inferred_from_columns": inferred_from_columns,
+            "fold_size_rows": cv_fold_size_rows,
+            "n_splits_derived_from_fold_size": derived_from_fold_size,
         }
         return splits, "DateTimeSeriesSplitter", meta
 
@@ -444,6 +544,8 @@ def _build_cv_splits(
             "stratify_column": cv_stratify_column,
             "fallback_applied": False,
             "inferred_from_columns": inferred_from_columns,
+            "fold_size_rows": cv_fold_size_rows,
+            "n_splits_derived_from_fold_size": derived_from_fold_size,
         }
         return splits, "StratifiedKFold", meta
 
@@ -475,6 +577,8 @@ def _build_cv_splits(
                     "stratify_column": cv_stratify_column,
                     "fallback_applied": False,
                     "inferred_from_columns": inferred_from_columns,
+                    "fold_size_rows": cv_fold_size_rows,
+                    "n_splits_derived_from_fold_size": derived_from_fold_size,
                 }
                 return candidate_splits, "StratifyGroupCV", meta
 
@@ -493,6 +597,8 @@ def _build_cv_splits(
                 "fallback_applied": True,
                 "fallback_reason": "group constraints incompatible with stratified candidate folds",
                 "inferred_from_columns": inferred_from_columns,
+                "fold_size_rows": cv_fold_size_rows,
+                "n_splits_derived_from_fold_size": derived_from_fold_size,
             }
             return fallback_splits, "GroupKFold", meta
 
@@ -512,13 +618,19 @@ def _build_cv_splits(
                 "stratify_column": cv_stratify_column,
                 "fallback_applied": False,
                 "inferred_from_columns": inferred_from_columns,
+                "fold_size_rows": cv_fold_size_rows,
+                "n_splits_derived_from_fold_size": derived_from_fold_size,
             }
             return candidate_splits, "StratifyTimeCV", meta
 
         warnings.append(
             "stratifytimecv could not satisfy strict time-order constraints with stratified folds; falling back to timecv."
         )
-        splitter = DateTimeSeriesSplitter(cv_source_train[cv_date_column], n_splits=n_splits)
+        splitter = DateTimeSeriesSplitter(
+            cv_source_train[cv_date_column],
+            n_splits=n_splits,
+            test_size=time_test_size_rows,
+        )
         fallback_splits = _run_splitter(splitter, X_train, y_train, groups=None)
         meta = {
             "strategy_requested": "stratifytimecv",
@@ -530,9 +642,18 @@ def _build_cv_splits(
             "fallback_applied": True,
             "fallback_reason": "time constraints incompatible with stratified candidate folds",
             "inferred_from_columns": inferred_from_columns,
+            "fold_size_rows": cv_fold_size_rows,
+            "n_splits_derived_from_fold_size": derived_from_fold_size,
         }
         return fallback_splits, "DateTimeSeriesSplitter", meta
 
+    if derived_from_fold_size:
+        if isinstance(selected_cv, int):
+            cv_params = {**cv_params, "n_splits": int(n_splits)}
+        elif isinstance(selected_cv, str):
+            selected_key_for_params = _canonical_name(selected_cv)
+            if selected_key_for_params in NSPLITS_PARAM_SPLITTER_KEYS:
+                cv_params = {**cv_params, "n_splits": int(n_splits)}
     cv_splitter = resolve_cv_splitter(
         cv=selected_cv,
         task=task,
@@ -562,6 +683,8 @@ def _build_cv_splits(
         "stratify_column": cv_stratify_column,
         "fallback_applied": False,
         "inferred_from_columns": inferred_from_columns,
+        "fold_size_rows": cv_fold_size_rows,
+        "n_splits_derived_from_fold_size": derived_from_fold_size,
     }
     return cv_splits, _splitter_display_name(cv_splitter), meta
 
@@ -575,6 +698,7 @@ def plan_splits(
     test_size: float,
     test_size_rows: int | None = None,
     cv_params: dict[str, Any] | None = None,
+    cv_fold_size_rows: int | None = None,
     split_group_columns: Sequence[str] | None = None,
     split_date_column: str | None = None,
     split_stratify_column: str | None = None,
@@ -650,6 +774,7 @@ def plan_splits(
         cv_date_column=resolved_split_date_column,
         cv_stratify_column=resolved_split_stratify_column,
         cv_source_train=cv_source_train,
+        cv_fold_size_rows=cv_fold_size_rows,
         warnings=split_warnings,
     )
 
@@ -686,6 +811,8 @@ def plan_splits(
             "fallback_applied": bool(cv_meta.get("fallback_applied", False)),
             "fallback_reason": cv_meta.get("fallback_reason"),
             "inferred_from_columns": bool(cv_meta.get("inferred_from_columns", False)),
+            "fold_size_rows": cv_meta.get("fold_size_rows"),
+            "n_splits_derived_from_fold_size": bool(cv_meta.get("n_splits_derived_from_fold_size", False)),
             "folds": fold_rows,
         },
     }

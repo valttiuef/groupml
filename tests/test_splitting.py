@@ -251,3 +251,66 @@ def test_plan_splits_supports_test_size_rows() -> None:
     )
     assert split_plan.split_info["test"]["test_size"] == 5
     assert split_plan.test_indices.tolist() == [20, 21, 22, 23, 24]
+
+
+def test_plan_splits_resolves_n_splits_from_cv_fold_size_rows_for_non_time_cv() -> None:
+    df = _sample_df_with_split_columns(n=250)
+    X = df[["x1", "x2"]]
+    y = df["Target"]
+    split_plan = plan_splits(
+        X=X,
+        y=y,
+        task="regression",
+        cv=5,
+        random_state=42,
+        test_size=0.2,
+        cv_fold_size_rows=36,
+        cv_source_df=df,
+    )
+    train_rows = split_plan.split_info["test"]["train_size"]
+    expected_n_splits = train_rows // 36
+    assert split_plan.split_info["cv"]["n_splits"] == expected_n_splits
+    assert split_plan.split_info["cv"]["n_splits_derived_from_fold_size"] is True
+    assert split_plan.split_info["cv"]["fold_size_rows"] == 36
+
+
+def test_plan_splits_timecv_uses_cv_fold_size_rows_as_validation_size() -> None:
+    df = _sample_df_with_split_columns(n=300)
+    X = df[["x1", "x2"]]
+    y = df["Target"]
+    split_plan = plan_splits(
+        X=X,
+        y=y,
+        task="regression",
+        cv=5,
+        random_state=42,
+        test_size=0.2,
+        split_date_column="BatchDate",
+        cv_fold_size_rows=36,
+        cv_source_df=df,
+    )
+
+    val_sizes = [len(val_idx) for _, val_idx in split_plan.cv_splits]
+    assert len(val_sizes) == 5
+    assert all(size == 36 for size in val_sizes)
+    assert split_plan.split_info["cv"]["fold_size_rows"] == 36
+
+
+def test_plan_splits_timecv_allows_single_split() -> None:
+    df = _sample_df_with_split_columns(n=120)
+    X = df[["x1", "x2"]]
+    y = df["Target"]
+    split_plan = plan_splits(
+        X=X,
+        y=y,
+        task="regression",
+        cv=1,
+        random_state=42,
+        test_size=0.2,
+        split_date_column="BatchDate",
+        cv_fold_size_rows=18,
+        cv_source_df=df,
+    )
+    assert split_plan.split_info["cv"]["n_splits"] == 1
+    assert len(split_plan.cv_splits) == 1
+    assert len(split_plan.cv_splits[0][1]) == 18

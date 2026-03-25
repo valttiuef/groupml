@@ -69,3 +69,21 @@ def test_functional_api_callbacks() -> None:
     assert not result.leaderboard.empty
     assert "run_started" in events
     assert "run_finished" in events
+
+
+def test_result_contains_default_raw_report() -> None:
+    df = _sample_df()
+    config = GroupMLConfig(
+        target="Target",
+        group_columns=["ActionGroup"],
+        experiment_modes=["full"],
+        models=[LinearRegression()],
+        feature_selectors=["none"],
+        cv=3,
+    )
+    result = GroupMLRunner(config).fit_evaluate(df)
+    assert not result.raw_report.empty
+    assert "split_assignment" in result.raw_report.columns
+    assert "actual" in result.raw_report.columns
+    assert "predicted" in result.raw_report.columns
+    assert "error" in result.raw_report.columns

@@ -11,6 +11,7 @@ from groupml import (
     compare_group_strategies_file,
     default_report_filename,
     default_summary_filename,
+    export_raw_report,
     export_report,
     export_summary,
     fit_evaluate_file,
@@ -123,6 +124,20 @@ def test_export_report_unsupported_extension(tmp_path: Path) -> None:
     result = GroupMLResult(leaderboard=leaderboard, recommendation="ok")
     with pytest.raises(ValueError, match="Unsupported report extension"):
         export_report(result, tmp_path / "report.json")
+
+
+def test_export_raw_report_csv(tmp_path: Path) -> None:
+    raw = pd.DataFrame([{"row_index": 0, "split_assignment": "cv_1", "actual": 1.0, "predicted": 0.9, "error": -0.1}])
+    leaderboard = pd.DataFrame([{"mode": "full", "cv_mean": 0.1, "test_score": 0.2}])
+    from groupml.result import GroupMLResult
+
+    result = GroupMLResult(leaderboard=leaderboard, recommendation="ok", raw_report=raw)
+    path = tmp_path / "raw.csv"
+    out = export_raw_report(result, path)
+    assert out == path
+    assert path.exists()
+    written = pd.read_csv(path)
+    assert list(written["split_assignment"]) == ["cv_1"]
 
 
 def test_export_summary_csv(tmp_path: Path) -> None:

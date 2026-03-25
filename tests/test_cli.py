@@ -92,6 +92,7 @@ def test_cli_main_parses_arguments(monkeypatch) -> None:
     assert cfg.models == "trees"
     assert cfg.feature_selectors == "mutual_info"
     assert cfg.cv == 3
+    assert cfg.cv_fold_size_rows is None
     assert cfg.test_split_strategy == "last_rows"
     assert cfg.test_size == 0.15
     assert cfg.test_size_rows is None
@@ -99,6 +100,59 @@ def test_cli_main_parses_arguments(monkeypatch) -> None:
     assert isinstance(captured["callbacks"], list)
     assert len(captured["callbacks"]) == 1
     assert captured["summary_export_path"] == Path.cwd() / "default_name.csv"
+
+
+def test_cli_main_parses_cv_fold_size_rows(monkeypatch) -> None:
+    from groupml import cli
+
+    captured: dict[str, object] = {}
+
+    def _fake_fit_evaluate_file(
+        path: str,
+        config: GroupMLConfig,
+        callbacks: object = None,
+        **read_kwargs: object,
+    ) -> GroupMLResult:
+        captured["path"] = path
+        captured["config"] = config
+        captured["callbacks"] = callbacks
+        captured["read_kwargs"] = read_kwargs
+        leaderboard = pd.DataFrame(
+            [
+                {
+                    "experiment_name": "full::linear::none",
+                    "mode": "full",
+                    "cv_mean": 0.9,
+                    "test_score": 0.8,
+                }
+            ]
+        )
+        return GroupMLResult(
+            leaderboard=leaderboard,
+            recommendation="Use full",
+            best_experiment=leaderboard.iloc[0].to_dict(),
+            baseline_experiment=leaderboard.iloc[0].to_dict(),
+        )
+
+    monkeypatch.setattr(cli, "fit_evaluate_file", _fake_fit_evaluate_file)
+    monkeypatch.setattr(cli, "export_summary", lambda result, path, top_n=10, sheet_name="summary": Path(path))
+    monkeypatch.setattr(cli, "default_summary_filename", lambda ext=".csv": f"default_name{ext}")
+
+    exit_code = cli.main(
+        [
+            "--path",
+            "data.csv",
+            "--target",
+            "Target",
+            "--cv-fold-size-rows",
+            "36",
+        ]
+    )
+
+    assert exit_code == 0
+    cfg = captured["config"]
+    assert isinstance(cfg, GroupMLConfig)
+    assert cfg.cv_fold_size_rows == 36
 
 
 def test_cli_main_parses_cv_columns(monkeypatch) -> None:
@@ -617,6 +671,7 @@ def test_cli_main_exports_partial_outputs_on_keyboard_interrupt(monkeypatch, tmp
     captured: dict[str, object] = {}
     summary_out = tmp_path / "partial_summary.csv"
     leaderboard_out = tmp_path / "partial_leaderboard.csv"
+    raw_out = tmp_path / "partial_raw.csv"
 
     def _fake_fit_evaluate_file(
         path: str,
@@ -647,6 +702,18 @@ def test_cli_main_exports_partial_outputs_on_keyboard_interrupt(monkeypatch, tmp
                     "selector": "none",
                     "cv_mean": 0.85,
                     "test_score": 0.8,
+                    "best_so_far_updated": True,
+                    "best_raw_report": pd.DataFrame(
+                        [
+                            {
+                                "row_index": 0,
+                                "split_assignment": "cv_1",
+                                "actual": 1.0,
+                                "predicted": 0.9,
+                                "error": -0.1,
+                            }
+                        ]
+                    ),
                 }
             )
         raise KeyboardInterrupt()
@@ -672,9 +739,20 @@ def test_cli_main_exports_partial_outputs_on_keyboard_interrupt(monkeypatch, tmp
         captured["report_export_path"] = Path(path)
         return Path(path)
 
+    def _fake_export_raw_report(
+        result: GroupMLResult,
+        path: str | Path,
+        sheet_name: str = "raw_report",
+    ) -> Path:
+        del sheet_name
+        captured["raw_result"] = result
+        captured["raw_export_path"] = Path(path)
+        return Path(path)
+
     monkeypatch.setattr(cli, "fit_evaluate_file", _fake_fit_evaluate_file)
     monkeypatch.setattr(cli, "export_summary", _fake_export_summary)
     monkeypatch.setattr(cli, "export_report", _fake_export_report)
+    monkeypatch.setattr(cli, "export_raw_report", _fake_export_raw_report)
 
     exit_code = cli.main(
         [
@@ -686,15 +764,20 @@ def test_cli_main_exports_partial_outputs_on_keyboard_interrupt(monkeypatch, tmp
             str(summary_out),
             "--leaderboard-out",
             str(leaderboard_out),
+            "--raw-report-out",
+            str(raw_out),
         ]
     )
 
     assert exit_code == 130
     assert captured["summary_export_path"] == summary_out
     assert captured["report_export_path"] == leaderboard_out
+    assert captured["raw_export_path"] == raw_out
 
     partial_result = captured["summary_result"]
     assert isinstance(partial_result, GroupMLResult)
     assert len(partial_result.leaderboard) == 1
     assert partial_result.leaderboard.iloc[0]["experiment_name"] == "full:all_features"
     assert "Run interrupted" in partial_result.recommendation
+    assert isinstance(partial_result.raw_report, pd.DataFrame)
+    assert not partial_result.raw_report.empty

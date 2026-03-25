@@ -11,7 +11,9 @@ import pandas as pd
 
 from .config import GroupMLConfig
 from .file_utils import (
+    default_report_filename,
     default_summary_filename,
+    export_raw_report,
     export_report,
     export_summary,
     fit_evaluate_file,
@@ -119,6 +121,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--cv-fold-size-rows",
+        type=int,
+        default=None,
+        help=(
+            "Optional CV fold size in rows. "
+            "For non-time CV this resolves fold count from train_rows // size. "
+            "For time CV this is used as validation block size per split."
+        ),
+    )
+    parser.add_argument(
         "--split-group-column",
         "--cv-group-column",
         dest="split_group_column",
@@ -190,6 +202,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional raw leaderboard output path (.csv/.xls/.xlsx).",
     )
+    parser.add_argument(
+        "--raw-report-out",
+        default=None,
+        help="Optional per-row raw report output path (.csv/.xls/.xlsx).",
+    )
+    parser.add_argument(
+        "--no-raw-report",
+        action="store_true",
+        help="Disable per-row raw report export.",
+    )
     return parser
 
 
@@ -214,6 +236,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         models=args.models,
         feature_selectors=args.feature_selectors,
         cv=_parse_cv_value(args.cv),
+        cv_fold_size_rows=args.cv_fold_size_rows,
         split_group_column=args.split_group_column,
         split_date_column=args.split_date_column,
         split_stratify_column=args.split_stratify_column,
@@ -228,6 +251,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         scale_numeric=args.scale_numeric,
         dropna_base_rows=not args.keep_nans,
         drop_static_base_features=not args.keep_static_features,
+        raw_report_enabled=not args.no_raw_report,
         min_target=args.min_target,
         max_target=args.max_target,
     )
@@ -257,9 +281,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     partial_split_info: dict[str, object] = {}
     partial_total_experiments = 0
     partial_completed_experiments = 0
+    partial_best_raw_report = pd.DataFrame()
 
     def _capture_progress_callback(event: dict[str, object]) -> None:
-        nonlocal partial_total_experiments, partial_completed_experiments, partial_split_info
+        nonlocal partial_total_experiments, partial_completed_experiments, partial_split_info, partial_best_raw_report
         event_name = event.get("event")
         if event_name == "run_started":
             try:
@@ -278,6 +303,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "date_column": event.get("split_date_column"),
                     "stratify_column": event.get("split_stratify_column"),
                     "inferred_from_columns": event.get("cv_inferred_from_columns"),
+                    "fold_size_rows": event.get("cv_fold_size_rows"),
+                    "n_splits_derived_from_fold_size": event.get("cv_n_splits_derived_from_fold_size"),
                 }
             }
             return
@@ -302,6 +329,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "test_score": event.get("test_score", float("nan")),
                 }
             )
+            if bool(event.get("best_so_far_updated")):
+                candidate_raw = event.get("best_raw_report")
+                if isinstance(candidate_raw, pd.DataFrame):
+                    partial_best_raw_report = candidate_raw.copy()
 
     def _cli_progress_callback(event: dict[str, object]) -> None:
         event_name = event.get("event")
@@ -311,10 +342,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             strategy = event.get("cv_strategy_used", "unknown")
             folds = int(event.get("cv_n_splits", 0))
             inferred = " [inferred]" if bool(event.get("cv_inferred_from_columns")) else ""
+            fold_size_rows = event.get("cv_fold_size_rows")
+            is_time_strategy = str(strategy).lower() in {"timecv", "stratifytimecv", "timeseriessplit"}
+            fold_size_suffix = ""
+            if is_time_strategy and fold_size_rows is not None:
+                fold_size_suffix = f", fold_size_rows={fold_size_rows}"
             print(
                 f"[groupml] Running {total} experiment(s) | cv={splitter} "
-                f"(strategy={strategy}, folds={folds}){inferred}"
+                f"(strategy={strategy}, folds={folds}{fold_size_suffix}){inferred}"
             )
+            if bool(event.get("cv_n_splits_derived_from_fold_size")):
+                fold_size = event.get("cv_fold_size_rows")
+                print(f"[groupml] CV folds derived from cv_fold_size_rows={fold_size}: using n_splits={folds}")
             if bool(event.get("cv_fallback_applied")):
                 reason = event.get("cv_fallback_reason", "constraint mismatch")
                 print(f"[groupml] CV hybrid fallback applied ({reason}); check warnings in final summary.")
@@ -381,6 +420,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             best_experiment=best,
             baseline_experiment=baseline,
             split_info=partial_split_info,
+            raw_report=partial_best_raw_report,
         )
         print()
         print(
@@ -401,5 +441,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.leaderboard_out:
         leaderboard_path = export_report(result, Path(args.leaderboard_out))
         print(f"Saved leaderboard: {leaderboard_path}")
+    if not args.no_raw_report and isinstance(result.raw_report, pd.DataFrame) and (interrupted or not result.raw_report.empty):
+        if args.raw_report_out:
+            raw_report_path = Path(args.raw_report_out)
+        else:
+            base = saved_path if saved_path.suffix else Path.cwd() / default_report_filename(ext=".csv")
+            raw_report_path = base.with_name(f"{base.stem}_raw.csv")
+        written_raw_path = export_raw_report(result, raw_report_path)
+        print(f"Saved raw report: {written_raw_path}")
 
     return 130 if interrupted else 0

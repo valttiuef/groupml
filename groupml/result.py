@@ -20,6 +20,7 @@ class GroupMLResult:
     best_experiment: dict[str, Any] = field(default_factory=dict)
     baseline_experiment: dict[str, Any] = field(default_factory=dict)
     split_info: dict[str, Any] = field(default_factory=dict)
+    raw_report: pd.DataFrame = field(default_factory=pd.DataFrame)
 
     def summary_text(self) -> str:
         """Return a practical human-readable summary."""

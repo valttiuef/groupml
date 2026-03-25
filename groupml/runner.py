@@ -98,6 +98,7 @@ class GroupMLRunner:
             test_size=self.config.test_size,
             test_size_rows=self.config.test_size_rows,
             cv_params=self.config.cv_params,
+            cv_fold_size_rows=self.config.cv_fold_size_rows,
             split_group_columns=split_group_columns,
             split_date_column=split_date_column,
             split_stratify_column=split_stratify_column,
@@ -134,6 +135,8 @@ class GroupMLRunner:
         rows: list[dict[str, Any]] = []
         modes = default_experiment_names(self.config)
         completed_experiments = 0
+        best_so_far_row: dict[str, Any] | None = None
+        best_so_far_raw_report = pd.DataFrame()
 
         self._emit_callbacks(
             callback_list,
@@ -158,6 +161,10 @@ class GroupMLRunner:
                 "cv_date_column": split_plan.split_info.get("cv", {}).get("date_column"),
                 "cv_stratify_column": split_plan.split_info.get("cv", {}).get("stratify_column"),
                 "cv_inferred_from_columns": split_plan.split_info.get("cv", {}).get("inferred_from_columns"),
+                "cv_fold_size_rows": split_plan.split_info.get("cv", {}).get("fold_size_rows"),
+                "cv_n_splits_derived_from_fold_size": split_plan.split_info.get("cv", {}).get(
+                    "n_splits_derived_from_fold_size"
+                ),
             },
         )
 
@@ -175,8 +182,31 @@ class GroupMLRunner:
             )
 
         def _mark_experiment_completed(row: dict[str, Any]) -> None:
-            nonlocal completed_experiments
+            nonlocal completed_experiments, best_so_far_row, best_so_far_raw_report
             completed_experiments += 1
+            best_updated = False
+            if self._is_better_experiment_row(row, best_so_far_row):
+                best_so_far_row = dict(row)
+                best_updated = True
+                if self.config.raw_report_enabled:
+                    try:
+                        best_so_far_raw_report = self._build_raw_report(
+                            data=data,
+                            split_plan=split_plan,
+                            task=task,
+                            models=models,
+                            selectors=selectors,
+                            feature_cols=feature_cols,
+                            group_cols=group_cols,
+                            parsed_rules=parsed_rules,
+                            X_train=X_train,
+                            y_train=y_train,
+                            y_full=y,
+                            best_row=best_so_far_row,
+                            warnings=warnings,
+                        )
+                    except Exception as exc:
+                        warnings.append(f"Best-so-far raw report generation failed: {exc}")
             self._emit_callbacks(
                 callback_list,
                 warnings,
@@ -191,6 +221,9 @@ class GroupMLRunner:
                     "test_score": row.get("test_score"),
                     "completed_experiments": completed_experiments,
                     "total_experiments": total_experiments,
+                    "best_so_far_updated": best_updated,
+                    "best_experiment_name": (best_so_far_row or {}).get("experiment_name"),
+                    "best_raw_report": best_so_far_raw_report if best_updated else None,
                 },
             )
 
@@ -321,6 +354,46 @@ class GroupMLRunner:
         baseline_row = self._pick_baseline(leaderboard)
         best_row = leaderboard.iloc[0].to_dict()
         recommendation = self._recommend(best_row, baseline_row, warnings)
+        raw_report = pd.DataFrame()
+        if self.config.raw_report_enabled:
+            try:
+                if not best_so_far_raw_report.empty and best_so_far_row is not None:
+                    if best_so_far_row.get("experiment_name") == best_row.get("experiment_name"):
+                        raw_report = best_so_far_raw_report
+                    else:
+                        raw_report = self._build_raw_report(
+                            data=data,
+                            split_plan=split_plan,
+                            task=task,
+                            models=models,
+                            selectors=selectors,
+                            feature_cols=feature_cols,
+                            group_cols=group_cols,
+                            parsed_rules=parsed_rules,
+                            X_train=X_train,
+                            y_train=y_train,
+                            y_full=y,
+                            best_row=best_row,
+                            warnings=warnings,
+                        )
+                else:
+                    raw_report = self._build_raw_report(
+                        data=data,
+                        split_plan=split_plan,
+                        task=task,
+                        models=models,
+                        selectors=selectors,
+                        feature_cols=feature_cols,
+                        group_cols=group_cols,
+                        parsed_rules=parsed_rules,
+                        X_train=X_train,
+                        y_train=y_train,
+                        y_full=y,
+                        best_row=best_row,
+                        warnings=warnings,
+                    )
+            except Exception as exc:
+                warnings.append(f"Raw report generation failed: {exc}")
 
         self._emit_callbacks(
             callback_list,
@@ -342,7 +415,214 @@ class GroupMLRunner:
             best_experiment=best_row,
             baseline_experiment=baseline_row,
             split_info=split_plan.split_info,
+            raw_report=raw_report,
         )
+
+    def _is_better_experiment_row(
+        self,
+        candidate: dict[str, Any],
+        current_best: dict[str, Any] | None,
+    ) -> bool:
+        if current_best is None:
+            return True
+        candidate_cv = float(candidate.get("cv_mean", np.nan))
+        current_cv = float(current_best.get("cv_mean", np.nan))
+        if np.isnan(current_cv) and not np.isnan(candidate_cv):
+            return True
+        if np.isnan(candidate_cv) and not np.isnan(current_cv):
+            return False
+        if candidate_cv > current_cv:
+            return True
+        if candidate_cv < current_cv:
+            return False
+        candidate_test = float(candidate.get("test_score", np.nan))
+        current_test = float(current_best.get("test_score", np.nan))
+        if np.isnan(current_test) and not np.isnan(candidate_test):
+            return True
+        if np.isnan(candidate_test) and not np.isnan(current_test):
+            return False
+        return candidate_test > current_test
+
+    def _build_raw_report(
+        self,
+        data: pd.DataFrame,
+        split_plan: Any,
+        task: str,
+        models: dict[str, Any],
+        selectors: dict[str, Any],
+        feature_cols: list[str],
+        group_cols: list[str],
+        parsed_rules: list[Any],
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        y_full: pd.Series,
+        best_row: dict[str, Any],
+        warnings: list[str],
+    ) -> pd.DataFrame:
+        estimator = self._build_best_estimator(
+            best_row=best_row,
+            task=task,
+            models=models,
+            selectors=selectors,
+            feature_cols=feature_cols,
+            group_cols=group_cols,
+            parsed_rules=parsed_rules,
+            X_train=X_train,
+        )
+
+        n_rows = len(data)
+        per_row_predictions: list[list[Any]] = [[] for _ in range(n_rows)]
+        split_labels: list[set[str]] = [set() for _ in range(n_rows)]
+
+        for fold_idx, (train_idx, val_idx) in enumerate(split_plan.cv_splits, start=1):
+            fold_estimator = clone(estimator)
+            X_tr = X_train.iloc[train_idx]
+            y_tr = y_train.iloc[train_idx]
+            X_val = X_train.iloc[val_idx]
+            try:
+                fold_estimator.fit(X_tr, y_tr)
+                val_pred = fold_estimator.predict(X_val)
+            except Exception as exc:
+                warnings.append(f"Raw report CV prediction failure on fold {fold_idx}: {exc}")
+                continue
+            global_val_idx = split_plan.train_indices[val_idx]
+            for idx, pred in zip(global_val_idx, val_pred):
+                per_row_predictions[int(idx)].append(pred)
+                split_labels[int(idx)].add(f"cv_{fold_idx}")
+
+        fitted = clone(estimator)
+        fitted.fit(X_train, y_train)
+        X_test = data[feature_cols].iloc[split_plan.test_indices]
+        test_pred = fitted.predict(X_test)
+        for idx, pred in zip(split_plan.test_indices, test_pred):
+            per_row_predictions[int(idx)].append(pred)
+            split_labels[int(idx)].add("test")
+
+        prediction: list[Any] = [np.nan] * n_rows
+        for row_idx, values in enumerate(per_row_predictions):
+            if not values:
+                continue
+            if task == "regression":
+                prediction[row_idx] = float(np.mean(np.asarray(values, dtype=float)))
+            else:
+                counts = pd.Series(values).value_counts(dropna=False)
+                prediction[row_idx] = counts.index[0]
+
+        split_assignment: list[str] = []
+        for row_idx in range(n_rows):
+            labels = split_labels[row_idx]
+            if labels:
+                split_assignment.append("|".join(sorted(labels)))
+            else:
+                split_assignment.append("train")
+
+        report = pd.DataFrame(
+            {
+                "row_index": np.arange(n_rows, dtype=int),
+                "split_assignment": split_assignment,
+                "actual": y_full.to_numpy(),
+                "predicted": prediction,
+            }
+        )
+
+        if task == "regression":
+            report["error"] = report["predicted"] - report["actual"]
+        else:
+            report["error"] = np.where(
+                report["predicted"].isna(),
+                np.nan,
+                (report["predicted"] != report["actual"]).astype(float),
+            )
+
+        identity_columns = list(
+            dict.fromkeys(
+                list(self.config.split_group_columns or [])
+                + ([self.config.split_group_column] if self.config.split_group_column else [])
+                + ([self.config.split_stratify_column] if self.config.split_stratify_column else [])
+                + ([self.config.split_date_column] if self.config.split_date_column else [])
+                + group_cols
+            )
+        )
+        identity_columns = [c for c in identity_columns if c in data.columns]
+        sample_columns = [c for c in data.columns if c != self.config.target][: self.config.raw_report_max_columns]
+        sample_columns = [c for c in sample_columns if c not in identity_columns]
+
+        ordered_columns = (
+            ["row_index"]
+            + identity_columns
+            + sample_columns
+            + ["split_assignment", "actual", "predicted", "error"]
+        )
+        return report.join(data[identity_columns + sample_columns]).loc[:, ordered_columns]
+
+    def _build_best_estimator(
+        self,
+        best_row: dict[str, Any],
+        task: str,
+        models: dict[str, Any],
+        selectors: dict[str, Any],
+        feature_cols: list[str],
+        group_cols: list[str],
+        parsed_rules: list[Any],
+        X_train: pd.DataFrame,
+    ) -> Any:
+        mode = str(best_row.get("mode"))
+        variant = str(best_row.get("variant"))
+        model_name = str(best_row.get("model"))
+        selector_name = str(best_row.get("selector"))
+
+        if model_name not in models:
+            raise ValueError(f"Best experiment model '{model_name}' not found in configured models.")
+        if selector_name not in selectors:
+            raise ValueError(f"Best experiment selector '{selector_name}' not found in configured selectors.")
+
+        if mode == "group_as_features":
+            selected_feature_cols = list(feature_cols)
+        else:
+            selected_feature_cols = [c for c in feature_cols if c not in group_cols]
+
+        preprocessor = build_preprocessor(X_train, selected_feature_cols, self.config.scale_numeric)
+        selector = build_selector(selectors[selector_name], task, self.config.random_state)
+        steps = [("preprocess", preprocessor)]
+        if selector != "passthrough":
+            steps.append(("select", selector))
+        steps.append(("model", models[model_name]))
+        base = Pipeline(steps=steps)
+
+        if mode in {"full", "group_as_features"}:
+            return base
+        if mode in {"group_split", "group_permutations"}:
+            split_columns = tuple(c for c in variant.split("+") if c)
+            if not split_columns:
+                raise ValueError(f"Could not resolve split columns from best variant '{variant}'.")
+            if task == "classification":
+                return GroupSplitClassifier(
+                    base_estimator=base,
+                    split_columns=split_columns,
+                    min_group_size=self.config.min_group_size,
+                    task=task,
+                )
+            return GroupSplitRegressor(
+                base_estimator=base,
+                split_columns=split_columns,
+                min_group_size=self.config.min_group_size,
+                task=task,
+            )
+        if mode == "rule_split":
+            if task == "classification":
+                return RuleSplitClassifier(
+                    base_estimator=base,
+                    rules=parsed_rules,
+                    min_group_size=self.config.min_group_size,
+                    task=task,
+                )
+            return RuleSplitRegressor(
+                base_estimator=base,
+                rules=parsed_rules,
+                min_group_size=self.config.min_group_size,
+                task=task,
+            )
+        raise ValueError(f"Unsupported best experiment mode '{mode}'.")
 
     def _preprocess_base_dataset(
         self,

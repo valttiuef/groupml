@@ -38,6 +38,7 @@ class GroupMLConfig:
     feature_selectors: str | Sequence[Any] | dict[str, Any] = "default_fast"
     cv: int | str | dict[str, Any] | Any = 5
     cv_params: dict[str, Any] = field(default_factory=dict)
+    cv_fold_size_rows: int | None = None
     split_group_column: str | None = None
     split_group_columns: Sequence[str] | None = None
     split_date_column: str | None = None
@@ -57,6 +58,8 @@ class GroupMLConfig:
     scale_numeric: bool = False
     dropna_base_rows: bool = True
     drop_static_base_features: bool = True
+    raw_report_enabled: bool = True
+    raw_report_max_columns: int = 10
     min_target: float | None = None
     max_target: float | None = None
     min_group_size: int = 15
@@ -75,6 +78,9 @@ class GroupMLConfig:
             raise ValueError("cv must be an int or a splitter with .split.")
         if not isinstance(self.cv_params, dict):
             raise ValueError("cv_params must be a dictionary.")
+        if self.cv_fold_size_rows is not None:
+            if not isinstance(self.cv_fold_size_rows, int) or self.cv_fold_size_rows < 1:
+                raise ValueError("cv_fold_size_rows must be a positive integer or None.")
         # Promote legacy cv_* aliases into split_* fields when needed.
         if self.split_group_column is None and self.cv_group_column is not None:
             self.split_group_column = self.cv_group_column
@@ -101,3 +107,7 @@ class GroupMLConfig:
         if self.min_target is not None and self.max_target is not None:
             if self.min_target > self.max_target:
                 raise ValueError("min_target must be <= max_target.")
+        if not isinstance(self.raw_report_enabled, bool):
+            raise ValueError("raw_report_enabled must be a boolean.")
+        if not isinstance(self.raw_report_max_columns, int) or self.raw_report_max_columns < 1:
+            raise ValueError("raw_report_max_columns must be an integer >= 1.")
