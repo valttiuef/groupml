@@ -113,7 +113,7 @@ def test_summary_tables_include_best_configs_and_group_performance() -> None:
     assert not tables["group_performance"].empty
 
 
-def test_per_group_summary_rows_do_not_reuse_dataset_cv_or_test_scores() -> None:
+def test_per_group_summary_rows_include_method_level_cv_and_test_scores() -> None:
     df = _sample_df(n=220, seed=29)
     config = GroupMLConfig(
         target="Target",
@@ -128,8 +128,32 @@ def test_per_group_summary_rows_do_not_reuse_dataset_cv_or_test_scores() -> None
     per_group = summary[summary["section"] == "per_group_comparison"]
 
     assert not per_group.empty
-    assert per_group["cv_mean"].isna().all()
-    assert per_group["test_score"].isna().all()
+    assert per_group["cv_mean"].notna().any()
+    assert per_group["test_score"].notna().any()
+
+
+def test_summary_includes_group_split_combined_comparison() -> None:
+    df = _sample_df(n=220, seed=31)
+    config = GroupMLConfig(
+        target="Target",
+        group_columns=["ActionGroup"],
+        experiment_modes=["group_split"],
+        models=[LinearRegression()],
+        feature_selectors=["none"],
+        cv=3,
+    )
+    result = GroupMLRunner(config).fit_evaluate(df)
+    summary_tables = build_summary_tables(result)
+    summary_df = summary_tables["summary"]
+    comparison_rows = summary_df[summary_df["section"] == "group_split_combined_comparison"]
+
+    assert not comparison_rows.empty
+    assert {"optimized_per_group", "best_shared_single_config"}.issubset(set(comparison_rows["metric_name"]))
+
+    text = result.summary_text()
+    assert "Combined per-group comparison:" in text
+    assert "optimized_per_group" in text
+    assert "best_shared_single_config" in text
 
 
 def test_summary_tables_group_performance_handles_non_string_group_values() -> None:
@@ -166,7 +190,7 @@ def test_summary_tables_group_performance_handles_non_string_group_values() -> N
         recommendation="ok",
         best_experiment=leaderboard.iloc[0].to_dict(),
         baseline_experiment=leaderboard.iloc[0].to_dict(),
-        split_info={"cv": {"group_columns": ["MachineId"]}},
+        split_info={"configured_group_columns": ["MachineId"]},
         raw_report=raw_report,
     )
 
@@ -174,6 +198,8 @@ def test_summary_tables_group_performance_handles_non_string_group_values() -> N
 
     assert "group_performance" in tables
     assert not tables["group_performance"].empty
+    group_perf = tables["group_performance"]
+    assert {"cv_mean", "test_score"}.issubset(set(group_perf.columns))
 
 
 def test_runner_includes_method_type_label_for_full_mode() -> None:
@@ -248,7 +274,7 @@ def test_warning_table_includes_datetime_and_run_columns() -> None:
     assert {"warning_datetime", "run_datetime", "run_experiment", "warning"}.issubset(warnings.columns)
 
 
-def test_group_performance_avoids_row_level_high_cardinality_columns() -> None:
+def test_group_performance_is_not_inferred_without_explicit_group_columns() -> None:
     leaderboard = pd.DataFrame(
         [
             {
@@ -303,11 +329,8 @@ def test_group_performance_avoids_row_level_high_cardinality_columns() -> None:
         raw_report=raw_report,
     )
     tables = build_summary_tables(result)
-    assert "group_performance" in tables
-    group_perf = tables["group_performance"]
-    assert "DeviceId" not in set(group_perf["group_column"])
-    assert "Shift" in set(group_perf["group_column"])
-    assert "overall_method_comparison" in set(tables["summary"]["section"])
+    assert "group_performance" not in tables
+    assert set(tables["summary"]["section"]) == {"full_dataset_best"}
 
 
 def test_group_performance_prefers_configured_groups_over_fallback_guessing() -> None:

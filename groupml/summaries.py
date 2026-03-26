@@ -120,53 +120,16 @@ def _resolve_group_columns(
     raw_report: pd.DataFrame,
     filtered_eval_rows: pd.DataFrame,
 ) -> list[str]:
+    del raw_report
     split_info = result.split_info if isinstance(result.split_info, dict) else {}
     configured_cols = list(split_info.get("configured_group_columns", []) or [])
-    configured_cols = [c for c in configured_cols if c in filtered_eval_rows.columns]
-    configured_cols = [c for c in configured_cols if filtered_eval_rows[c].notna().any()]
-    if configured_cols:
-        return configured_cols
-
-    split_cols = list((split_info.get("cv", {}) or {}).get("group_columns", []) or [])
-    split_cols = [c for c in split_cols if c in filtered_eval_rows.columns]
-    split_cols = [c for c in split_cols if filtered_eval_rows[c].notna().any()]
-    if split_cols:
-        return split_cols
-
-    excluded = {
-        "row_index",
-        "split_assignment",
-        "actual",
-        "predicted",
-        "error",
-        "prediction_method",
-        "mode",
-        "method_type",
-        "experiment_name",
-        "model",
-        "selector",
-    }
-    excluded.update({c for c in raw_report.columns if c.startswith("predicted_") or c.startswith("error_")})
-    candidates = [
-        c
-        for c in filtered_eval_rows.columns
-        if c not in excluded and not str(c).startswith("__groupml_auto_stratify__")
-    ]
-    out: list[str] = []
-    max_cardinality = max(2, min(20, int(len(filtered_eval_rows) * 0.2)))
-    for col in candidates:
-        series = filtered_eval_rows[col].dropna()
-        if series.empty:
-            continue
-        unique_count = series.nunique(dropna=True)
-        if unique_count <= 1:
-            continue
-        if unique_count > max_cardinality:
-            continue
-        if pd.api.types.is_numeric_dtype(filtered_eval_rows[col]):
-            continue
-        out.append(col)
-    return out
+    profile_group_cols = list((split_info.get("group_profile", {}) or {}).get("group_columns", []) or [])
+    explicit_group_cols = list(dict.fromkeys([str(c) for c in configured_cols + profile_group_cols if str(c)]))
+    if explicit_group_cols:
+        present_cols = [c for c in explicit_group_cols if c in filtered_eval_rows.columns]
+        # Per-group summary is only valid for explicitly configured group columns.
+        return [c for c in present_cols if filtered_eval_rows[c].notna().any()]
+    return []
 
 
 def _build_full_dataset_rows(
@@ -208,6 +171,24 @@ def _build_per_group_rows(
     raw_report: pd.DataFrame,
     best_mode_map: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    def _compute_metric(frame: pd.DataFrame, pred_col: str, is_numeric: bool) -> float:
+        if frame.empty:
+            return np.nan
+        if is_numeric:
+            actual_values = pd.to_numeric(frame["actual"], errors="coerce")
+            pred_values = pd.to_numeric(frame[pred_col], errors="coerce")
+            mask = actual_values.notna() & pred_values.notna()
+            if not mask.any():
+                return np.nan
+            err = pred_values[mask] - actual_values[mask]
+            return float(np.sqrt(np.mean(np.square(err))))
+        actual = frame["actual"]
+        predicted = frame[pred_col]
+        mask = actual.notna() & predicted.notna()
+        if not mask.any():
+            return np.nan
+        return float((predicted[mask] == actual[mask]).mean())
+
     if raw_report.empty:
         return []
     predicted_cols = [
@@ -229,7 +210,7 @@ def _build_per_group_rows(
         mapped_mode = METHOD_TYPE_TO_MODE.get(method_type, "")
         best_row = best_mode_map.get(mapped_mode, {})
 
-        subset = eval_rows.loc[:, ["actual", pred_col] + group_cols].copy()
+        subset = eval_rows.loc[:, ["split_assignment", "actual", pred_col] + group_cols].copy()
         subset = subset.dropna(subset=[pred_col, "actual"])
         if subset.empty:
             continue
@@ -283,6 +264,8 @@ def _build_per_group_rows(
                 else:
                     metric_value = float((group_df[pred_col] == group_df["actual"]).mean())
                 group_value_str = str(group_value)
+                cv_rows = group_df[group_df["split_assignment"].astype(str).str.startswith("cv_")]
+                test_rows = group_df[group_df["split_assignment"].astype(str).str.contains("test")]
                 output.append(
                     {
                         "section": "per_group_comparison",
@@ -296,14 +279,87 @@ def _build_per_group_rows(
                         "experiment_name": best_row.get("experiment_name", ""),
                         "model": best_row.get("model", ""),
                         "selector": best_row.get("selector", ""),
-                        "cv_mean": np.nan,
-                        "test_score": np.nan,
+                        "cv_mean": _compute_metric(cv_rows, pred_col, is_numeric),
+                        "test_score": _compute_metric(test_rows, pred_col, is_numeric),
                         "n_eval_rows": n_eval,
                         "metric_name": metric_name,
                         "metric_value": metric_value,
-                        "notes": "Per-group metric_value computed on eval predictions for this group.",
+                        "notes": "Per-group metric_value uses all eval rows; cv_mean uses CV rows and test_score uses holdout rows for this group.",
                     }
                 )
+    return output
+
+
+def _build_group_split_comparison_rows(
+    leaderboard: pd.DataFrame,
+    prefers_lower: bool,
+) -> list[dict[str, Any]]:
+    if leaderboard.empty:
+        return []
+    if "mode" not in leaderboard.columns or "variant" not in leaderboard.columns:
+        return []
+    split_rows = leaderboard[leaderboard["mode"].isin(["group_split", "group_permutations"])].copy()
+    if split_rows.empty:
+        return []
+
+    output: list[dict[str, Any]] = []
+    for (mode, variant), variant_rows in split_rows.groupby(["mode", "variant"], dropna=False):
+        variant_df = variant_rows.copy()
+        optimized_mask = (variant_df["model"] == "per_group_best") & (
+            variant_df["selector"] == "per_group_best"
+        )
+        optimized_rows = variant_df.loc[optimized_mask]
+        shared_rows = variant_df.loc[~optimized_mask]
+        if optimized_rows.empty or shared_rows.empty:
+            continue
+
+        optimized_row = optimized_rows.sort_values(by=["cv_mean"], ascending=prefers_lower).iloc[0]
+        shared_row = shared_rows.sort_values(by=["cv_mean"], ascending=prefers_lower).iloc[0]
+        method_type = MODE_TO_METHOD_TYPE.get(str(mode), str(mode))
+        variant_value = str(variant)
+
+        output.append(
+            {
+                "section": "group_split_combined_comparison",
+                "view_order": 2,
+                "scope": "dataset",
+                "group_column": "",
+                "group_value": "ALL",
+                "method_type": method_type,
+                "mode": str(mode),
+                "variant": variant_value,
+                "experiment_name": str(optimized_row.get("experiment_name", "")),
+                "model": str(optimized_row.get("model", "")),
+                "selector": str(optimized_row.get("selector", "")),
+                "cv_mean": _safe_float(optimized_row.get("cv_mean")),
+                "test_score": _safe_float(optimized_row.get("test_score")),
+                "n_eval_rows": np.nan,
+                "metric_name": "optimized_per_group",
+                "metric_value": _safe_float(optimized_row.get("cv_mean")),
+                "notes": "Optimized model+selector per group.",
+            }
+        )
+        output.append(
+            {
+                "section": "group_split_combined_comparison",
+                "view_order": 2,
+                "scope": "dataset",
+                "group_column": "",
+                "group_value": "ALL",
+                "method_type": method_type,
+                "mode": str(mode),
+                "variant": variant_value,
+                "experiment_name": str(shared_row.get("experiment_name", "")),
+                "model": str(shared_row.get("model", "")),
+                "selector": str(shared_row.get("selector", "")),
+                "cv_mean": _safe_float(shared_row.get("cv_mean")),
+                "test_score": _safe_float(shared_row.get("test_score")),
+                "n_eval_rows": np.nan,
+                "metric_name": "best_shared_single_config",
+                "metric_value": _safe_float(shared_row.get("cv_mean")),
+                "notes": "Single shared model+selector for all groups (best by CV).",
+            }
+        )
     return output
 
 
@@ -474,6 +530,9 @@ def build_summary_tables(result: "GroupMLResult", top_n: int = 10) -> dict[str, 
     summary_rows.extend(
         _build_per_group_rows(result=result, raw_report=raw_report, best_mode_map=best_mode_map)
     )
+    summary_rows.extend(
+        _build_group_split_comparison_rows(leaderboard=leaderboard, prefers_lower=prefers_lower)
+    )
     if summary_rows:
         summary_table = pd.DataFrame(summary_rows, columns=SUMMARY_COLUMNS)
         summary_table = summary_table.sort_values(
@@ -498,6 +557,8 @@ def build_summary_tables(result: "GroupMLResult", top_n: int = 10) -> dict[str, 
                         "experiment_name",
                         "model",
                         "selector",
+                        "cv_mean",
+                        "test_score",
                         "n_eval_rows",
                         "metric_name",
                         "metric_value",
@@ -586,6 +647,32 @@ def summary_text(result: "GroupMLResult", top_n: int = 5) -> str:
                 f"selector={row.get('selector')} | cv_mean={_fmt(row.get('cv_mean'))} | "
                 f"test_score={_fmt(row.get('test_score'))}"
             )
+
+    leaderboard = result.leaderboard if isinstance(result.leaderboard, pd.DataFrame) else pd.DataFrame()
+    if not leaderboard.empty and "mode" in leaderboard.columns and "variant" in leaderboard.columns:
+        split_rows = leaderboard[leaderboard["mode"].isin(["group_split", "group_permutations"])].copy()
+        if not split_rows.empty:
+            lines.append("Combined per-group comparison:")
+            prefers_lower = bool(payload.get("cv_prefers_lower", False))
+            for (mode, variant), variant_rows in split_rows.groupby(["mode", "variant"], dropna=False):
+                optimized_mask = (variant_rows["model"] == "per_group_best") & (
+                    variant_rows["selector"] == "per_group_best"
+                )
+                optimized_rows = variant_rows.loc[optimized_mask]
+                shared_rows = variant_rows.loc[~optimized_mask]
+                if optimized_rows.empty or shared_rows.empty:
+                    continue
+                optimized_row = optimized_rows.sort_values(by=["cv_mean"], ascending=prefers_lower).iloc[0]
+                shared_row = shared_rows.sort_values(by=["cv_mean"], ascending=prefers_lower).iloc[0]
+                lines.append(
+                    f"- {mode}:{variant} | optimized_per_group cv_mean={_fmt(optimized_row.get('cv_mean'))} "
+                    f"test_score={_fmt(optimized_row.get('test_score'))}"
+                )
+                lines.append(
+                    f"- {mode}:{variant} | best_shared_single_config "
+                    f"{shared_row.get('model')}/{shared_row.get('selector')} "
+                    f"cv_mean={_fmt(shared_row.get('cv_mean'))} test_score={_fmt(shared_row.get('test_score'))}"
+                )
 
     lines.append(f"Recommendation: {payload.get('recommendation', '')}")
     lines.append(

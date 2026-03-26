@@ -74,14 +74,23 @@ class ParsedRule:
 class SafeSelectKBest(BaseEstimator, TransformerMixin):
     """SelectKBest that safely caps k to available columns at fit time."""
 
-    def __init__(self, score_func: Callable[..., Any], k: int = 20) -> None:
+    def __init__(self, score_func: Callable[..., Any], k: int | str = "auto") -> None:
         self.score_func = score_func
         self.k = k
         self._selector: SelectKBest | None = None
+        self.effective_k_: int | None = None
 
     def fit(self, X: Any, y: Any = None) -> "SafeSelectKBest":
+        n_samples = int(X.shape[0])
         n_features = X.shape[1]
-        k = min(max(1, self.k), n_features)
+        if isinstance(self.k, str):
+            if self.k != "auto":
+                raise ValueError("SafeSelectKBest.k must be a positive integer or 'auto'.")
+            k = self._auto_k(n_samples=n_samples, n_features=n_features)
+        else:
+            k = int(self.k)
+        k = min(max(1, k), n_features)
+        self.effective_k_ = k
         self._selector = SelectKBest(score_func=self.score_func, k=k)
         self._selector.fit(X, y)
         return self
@@ -90,6 +99,15 @@ class SafeSelectKBest(BaseEstimator, TransformerMixin):
         if self._selector is None:
             raise RuntimeError("SafeSelectKBest is not fitted.")
         return self._selector.transform(X)
+
+    @staticmethod
+    def _auto_k(n_samples: int, n_features: int) -> int:
+        if n_features <= 1:
+            return 1
+        # Mildly increases selected features with dataset information content.
+        # Works as a pragmatic default across small and medium industrial tables.
+        raw = int(round(np.sqrt(max(1.0, n_features) * np.log1p(max(2.0, float(n_samples))))))
+        return min(n_features, max(1, raw))
 
 
 def stable_f_regression(X: Any, y: Any) -> tuple[np.ndarray, np.ndarray]:
@@ -206,18 +224,35 @@ def normalize_selectors(selectors: Any, task: str) -> dict[str, Any]:
     raise ValueError("feature_selectors must be a selector/strategy string, sequence, or dict.")
 
 
-def build_selector(selector: Any, task: str, random_state: int) -> Any:
+def build_selector(selector: Any, task: str, random_state: int, kbest_features: int | str = "auto") -> Any:
     """Create a sklearn-compatible selector or passthrough marker."""
+    if isinstance(kbest_features, str):
+        token = kbest_features.strip().lower()
+        if token == "auto":
+            kbest_features = "auto"
+        elif token.isdigit() and int(token) >= 1:
+            kbest_features = int(token)
+        else:
+            raise ValueError("kbest_features must be a positive integer or 'auto'.")
+    elif not isinstance(kbest_features, int) or kbest_features < 1:
+        raise ValueError("kbest_features must be a positive integer or 'auto'.")
+
+    if isinstance(selector, dict):
+        selector_name = selector.get("name")
+        if selector_name is None:
+            raise ValueError("Selector dict must include a 'name' key.")
+        kbest_override = selector.get("k", kbest_features)
+        return build_selector(selector_name, task, random_state, kbest_features=kbest_override)
     if selector in {"none", None}:
         return "passthrough"
     if not isinstance(selector, str):
         return clone(selector)
     if selector == "kbest_f":
         fn = f_classif if task == "classification" else stable_f_regression
-        return SafeSelectKBest(score_func=fn, k=20)
+        return SafeSelectKBest(score_func=fn, k=kbest_features)
     if selector == "kbest_mi":
         fn = mutual_info_classif if task == "classification" else mutual_info_regression
-        return SafeSelectKBest(score_func=fn, k=20)
+        return SafeSelectKBest(score_func=fn, k=kbest_features)
     if selector == "lasso":
         if task == "classification":
             base = LogisticRegression(

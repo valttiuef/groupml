@@ -265,7 +265,10 @@ def export_summary(
         tables = build_summary_tables(result, top_n=top_n)
         try:
             with pd.ExcelWriter(output_path) as writer:
-                for idx, (name, table) in enumerate(tables.items()):
+                ordered_items = [(name, table) for name, table in tables.items() if name != "warnings"]
+                if "warnings" in tables:
+                    ordered_items.append(("warnings", tables["warnings"]))
+                for idx, (name, table) in enumerate(ordered_items):
                     if idx == 0:
                         safe_name = sheet_name[:31]
                     else:
@@ -323,13 +326,13 @@ def export_reporting_bundle(
             _format_openpyxl_worksheet(writer, "summary", summary_df)
             recommendations_df.to_excel(writer, index=False, sheet_name="recommendations")
             _format_openpyxl_worksheet(writer, "recommendations", recommendations_df)
-            warnings_df.to_excel(writer, index=False, sheet_name="warnings")
-            _format_openpyxl_worksheet(writer, "warnings", warnings_df)
             runs_df.to_excel(writer, index=False, sheet_name="all_runs")
             _format_openpyxl_worksheet(writer, "all_runs", runs_df)
             if include_raw:
                 raw_df.to_excel(writer, index=False, sheet_name="raw_results")
                 _format_openpyxl_worksheet(writer, "raw_results", raw_df)
+            warnings_df.to_excel(writer, index=False, sheet_name="warnings")
+            _format_openpyxl_worksheet(writer, "warnings", warnings_df)
         outputs: dict[str, Path] = {
             "workbook": output_path,
             "summary": output_path,

@@ -14,8 +14,9 @@ from .file_utils import (
     load_tabular_data,
     preferred_tabular_extension,
 )
+from .functional import compare_group_strategies
 from .result import GroupMLResult
-from .runner import GroupMLRunner, compare_group_strategies
+from .runner import GroupMLRunner
 from .splitting import plan_splits, resolve_cv_splitter
 
 __all__ = [

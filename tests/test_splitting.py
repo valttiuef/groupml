@@ -122,9 +122,9 @@ def test_plan_splits_prefers_timecv_over_groupcv_when_both_columns_provided() ->
         cv_source_df=df,
     )
 
-    assert split_plan.cv_splitter_name == "DateTimeSeriesSplitter"
-    assert split_plan.split_info["cv"]["strategy_requested"] == "timecv"
-    assert split_plan.split_info["cv"]["strategy_used"] == "timecv"
+    assert split_plan.cv_splitter_name == "StratifiedGroupTimeSeriesCV"
+    assert split_plan.split_info["cv"]["strategy_requested"] == "stratifytimecv"
+    assert split_plan.split_info["cv"]["strategy_used"] == "stratifytimecv"
 
 
 def test_plan_splits_infers_stratifycv_from_stratify_column() -> None:
@@ -187,6 +187,128 @@ def test_plan_splits_stratifytimecv_falls_back_to_timecv() -> None:
         cv_source_df=df,
     )
 
+    assert split_plan.split_info["cv"]["strategy_requested"] == "stratifytimecv"
+    assert split_plan.split_info["cv"]["strategy_used"] == "stratifytimecv"
+    assert split_plan.split_info["cv"]["fallback_applied"] is False
+
+
+def test_stratified_time_holdout_uses_group_based_split_when_no_stratify_column() -> None:
+    df = pd.DataFrame(
+        {
+            "x1": np.arange(8, dtype=float),
+            "x2": np.arange(8, dtype=float) * 0.1,
+            "Group": ["A", "B", "A", "B", "A", "B", "A", "B"],
+            "BatchDate": pd.to_datetime(
+                [
+                    "2024-01-01",
+                    "2024-01-02",
+                    "2024-01-03",
+                    "2024-01-04",
+                    "2024-01-05",
+                    "2024-01-06",
+                    "2024-01-07",
+                    "2024-01-08",
+                ]
+            ),
+            "Target": np.arange(8, dtype=float),
+        }
+    )
+    split_plan = plan_splits(
+        X=df[["x1", "x2"]],
+        y=df["Target"],
+        task="regression",
+        cv=2,
+        random_state=42,
+        test_size=0.25,
+        test_size_rows=4,
+        split_group_columns=["Group"],
+        split_date_column="BatchDate",
+        cv_source_df=df,
+    )
+    assert split_plan.test_splitter_name == "StratifiedTimeLastRowsSplit"
+    assert set(split_plan.test_indices.tolist()) == {4, 5, 6, 7}
+    assert split_plan.split_info["test"]["stratify_source"] == "groups:Group"
+    assert split_plan.split_info["test"]["fallback_applied"] is False
+
+
+def test_stratified_time_cv_has_expected_grouped_fold_indices() -> None:
+    df = pd.DataFrame(
+        {
+            "x1": np.arange(12, dtype=float),
+            "x2": np.arange(12, dtype=float) * 0.01,
+            "Group": ["A", "B"] * 6,
+            "BatchDate": pd.date_range("2024-01-01", periods=12, freq="D"),
+            "Target": np.arange(12, dtype=float),
+        }
+    )
+    split_plan = plan_splits(
+        X=df[["x1", "x2"]],
+        y=df["Target"],
+        task="regression",
+        cv=2,
+        random_state=42,
+        test_size=2 / 12,
+        test_size_rows=2,
+        split_group_columns=["Group"],
+        split_date_column="BatchDate",
+        cv_source_df=df,
+    )
+    assert split_plan.cv_splitter_name == "StratifiedGroupTimeSeriesCV"
+    assert split_plan.split_info["cv"]["strategy_used"] == "stratifytimecv"
+    fold_1_val = set(split_plan.train_indices[split_plan.cv_splits[0][1]].tolist())
+    fold_2_val = set(split_plan.train_indices[split_plan.cv_splits[1][1]].tolist())
+    assert fold_1_val == {6, 7}
+    assert fold_2_val == {8, 9}
+
+
+def test_stratified_time_cv_merges_sparse_groups_and_reports_ties() -> None:
+    df = pd.DataFrame(
+        {
+            "x1": np.arange(14, dtype=float),
+            "x2": np.arange(14, dtype=float) * 0.1,
+            "Group": ["A"] * 6 + ["B"] * 6 + ["C"] * 2,
+            "BatchDate": pd.date_range("2024-01-01", periods=14, freq="D"),
+            "Target": np.arange(14, dtype=float),
+        }
+    )
+    split_plan = plan_splits(
+        X=df[["x1", "x2"]],
+        y=df["Target"],
+        task="regression",
+        cv=2,
+        random_state=42,
+        test_size=0.2,
+        split_group_columns=["Group"],
+        split_date_column="BatchDate",
+        cv_source_df=df,
+    )
+    assert split_plan.split_info["cv"]["strategy_used"] == "stratifytimecv"
+    tied = split_plan.split_info["cv"]["tied_groups"]
+    assert isinstance(tied, dict)
+    assert tied
+
+
+def test_stratified_time_cv_falls_back_to_timecv_when_not_enough_group_buckets() -> None:
+    df = pd.DataFrame(
+        {
+            "x1": np.arange(8, dtype=float),
+            "x2": np.arange(8, dtype=float) * 0.1,
+            "Group": ["A", "B", "A", "B", "A", "B", "A", "B"],
+            "BatchDate": pd.date_range("2024-01-01", periods=8, freq="D"),
+            "Target": np.arange(8, dtype=float),
+        }
+    )
+    split_plan = plan_splits(
+        X=df[["x1", "x2"]],
+        y=df["Target"],
+        task="regression",
+        cv=3,
+        random_state=42,
+        test_size=0.25,
+        split_group_columns=["Group"],
+        split_date_column="BatchDate",
+        cv_source_df=df,
+    )
     assert split_plan.split_info["cv"]["strategy_requested"] == "stratifytimecv"
     assert split_plan.split_info["cv"]["strategy_used"] == "timecv"
     assert split_plan.split_info["cv"]["fallback_applied"] is True

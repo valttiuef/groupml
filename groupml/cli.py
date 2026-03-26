@@ -39,6 +39,15 @@ def _parse_cv_value(raw: str) -> int | str:
     return value
 
 
+def _parse_kbest_features(raw: str) -> int | str:
+    value = str(raw).strip().lower()
+    if value == "auto":
+        return "auto"
+    if value.isdigit() and int(value) >= 1:
+        return int(value)
+    raise ValueError("--kbest-features must be a positive integer or 'auto'.")
+
+
 def _resolve_test_size(
     *,
     test_size: float,
@@ -121,6 +130,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="feature_selectors",
         default="default_fast",
         help="Feature selector name or strategy (for example: default_fast, linear_default, none, kbest_f).",
+    )
+    parser.add_argument(
+        "--kbest-features",
+        default="auto",
+        help="Default feature count for kbest selectors (positive integer or 'auto').",
     )
     parser.add_argument(
         "--cv",
@@ -259,6 +273,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             test_size=args.test_size,
             test_size_strategy=args.test_size_strategy,
         )
+        kbest_features = _parse_kbest_features(args.kbest_features)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -270,6 +285,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         experiment_modes=args.modes or ["full", "group_as_features", "group_split", "group_permutations", "rule_split"],
         models=args.models,
         feature_selectors=args.feature_selectors,
+        kbest_features=kbest_features,
         cv=_parse_cv_value(args.cv),
         cv_fold_size_rows=args.cv_fold_size_rows,
         split_group_column=args.split_group_column,
@@ -326,6 +342,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             numeric = pd.to_numeric(display[col], errors="coerce")
             display[col] = numeric.where(~numeric.notna(), numeric.abs())
         return display
+
+    def _split_candidate_label(label: str) -> tuple[str, str]:
+        token = str(label or "")
+        if "__" in token:
+            model, selector = token.split("__", 1)
+            return model, selector
+        return token, ""
 
     partial_rows: list[dict[str, object]] = []
     partial_warnings: list[str] = []
@@ -399,6 +422,42 @@ def main(argv: Sequence[str] | None = None) -> int:
                 candidate_raw = event.get("best_raw_report")
                 if isinstance(candidate_raw, pd.DataFrame):
                     partial_best_raw_report = candidate_raw.copy()
+            return
+        if event_name == "group_model_selected":
+            mode = str(event.get("mode", "group_split"))
+            variant = str(event.get("variant", ""))
+            experiment_name = f"{mode}:{variant}" if variant else mode
+            selected_config = str(event.get("selected_config", ""))
+            selected_model, selected_selector = _split_candidate_label(selected_config)
+            partial_rows.append(
+                {
+                    "mode": mode,
+                    "method_type": str(event.get("method_type", MODE_LABELS.get(mode, mode))),
+                    "variant": variant,
+                    "experiment_name": experiment_name,
+                    "model": selected_model,
+                    "selector": selected_selector,
+                    "run_scope": "group",
+                    "group_key": str(event.get("group_key", "")),
+                    "group_index": event.get("group_index", float("nan")),
+                    "group_total": event.get("group_total", float("nan")),
+                    "group_selected_config": selected_config,
+                    "group_fallback_config": str(event.get("fallback_config", "")),
+                    "group_train_rows": event.get("group_train_rows", float("nan")),
+                    "group_test_rows": event.get("group_test_rows", float("nan")),
+                    "group_test_score": event.get("group_test_score", float("nan")),
+                    "group_test_metric": event.get("group_test_metric", ""),
+                    "run_datetime": event.get("run_datetime", partial_run_datetime),
+                    "cv_mean": event.get("group_cv_mean", float("nan")),
+                    "cv_std": float("nan"),
+                    "cv_folds_ok": float("nan"),
+                    "test_score": event.get("group_test_score", float("nan")),
+                    "train_rows": event.get("group_train_rows", float("nan")),
+                    "test_rows": event.get("group_test_rows", float("nan")),
+                    "run_status": "group_info",
+                }
+            )
+            return
 
     def _cli_progress_callback(event: dict[str, object]) -> None:
         event_name = event.get("event")
@@ -461,10 +520,167 @@ def main(argv: Sequence[str] | None = None) -> int:
             planned = int(event.get("planned_experiments", 0))
             print(f"[groupml] Mode {mode_label}: {planned} experiment(s)")
             return
+        if event_name == "group_split_variant_started":
+            method = str(event.get("method_type", "per_group_models"))
+            variant = str(event.get("variant", ""))
+            group_count = int(event.get("group_count", 0) or 0)
+            candidate_count = int(event.get("candidate_count", 0) or 0)
+            print(
+                f"[groupml] {method} ({variant}) training per-group models: "
+                f"{group_count} groups x {candidate_count} candidates"
+            )
+            return
+        if event_name == "group_split_shared_search_started":
+            method = str(event.get("method_type", "per_group_models"))
+            variant = str(event.get("variant", ""))
+            total = int(event.get("shared_total", 0) or 0)
+            print(f"[groupml] {method} ({variant}) comparing one shared model+selector across all groups ({total} candidates)")
+            return
+        if event_name == "group_split_shared_candidate_evaluated":
+            method = str(event.get("method_type", "per_group_models"))
+            variant = str(event.get("variant", ""))
+            idx = int(event.get("shared_index", 0) or 0)
+            total = int(event.get("shared_total", 0) or 0)
+            model = str(event.get("model", ""))
+            selector = str(event.get("selector", ""))
+            cv_mean = _format_score(event.get("cv_mean"), positive_rmse=rmse_display)
+            test_score = _format_score(event.get("test_score"), positive_rmse=rmse_display)
+            if rmse_display:
+                print(
+                    f"[groupml]   shared[{idx}/{total}] {model}/{selector} | "
+                    f"cv_rmse={cv_mean} | test_rmse={test_score}"
+                )
+            else:
+                print(
+                    f"[groupml]   shared[{idx}/{total}] {model}/{selector} | "
+                    f"cv_score={cv_mean} | test_score={test_score}"
+                )
+            return
+        if event_name == "group_split_optimized_search_started":
+            method = str(event.get("method_type", "per_group_models"))
+            variant = str(event.get("variant", ""))
+            groups = int(event.get("group_count", 0) or 0)
+            candidates = int(event.get("candidate_count", 0) or 0)
+            print(
+                f"[groupml] {method} ({variant}) training groups first "
+                f"({groups} groups x {candidates} candidates)"
+            )
+            return
+        if event_name == "group_tuning_group_started":
+            group_index = int(event.get("group_index", 0) or 0)
+            group_total = int(event.get("group_total", 0) or 0)
+            group_key = str(event.get("group_key", ""))
+            group_size = int(event.get("group_size", 0) or 0)
+            print(f"[groupml]   group {group_index}/{group_total}: {group_key} (n={group_size})")
+            return
+        if event_name == "group_tuning_candidate_scored":
+            candidate_index = int(event.get("candidate_index", 0) or 0)
+            candidate_total = int(event.get("candidate_total", 0) or 0)
+            candidate = str(event.get("candidate", ""))
+            model, selector = _split_candidate_label(candidate)
+            score = _format_score(event.get("cv_mean"), positive_rmse=rmse_display)
+            if rmse_display:
+                print(
+                    f"[groupml]     {candidate_index}/{candidate_total}: "
+                    f"model={model} | selector={selector} | cv_rmse={score}"
+                )
+            else:
+                print(
+                    f"[groupml]     {candidate_index}/{candidate_total}: "
+                    f"model={model} | selector={selector} | cv_score={score}"
+                )
+            return
+        if event_name == "group_tuning_group_finished":
+            group_key = str(event.get("group_key", ""))
+            best = str(event.get("best_candidate", ""))
+            best_model, best_selector = _split_candidate_label(best)
+            best_score = _format_score(event.get("best_score"), positive_rmse=rmse_display)
+            used_fallback = bool(event.get("used_fallback", False))
+            reason = str(event.get("reason", ""))
+            suffix = f" | fallback ({reason})" if used_fallback else ""
+            if rmse_display:
+                print(
+                    f"[groupml]   best for {group_key}: model={best_model} | "
+                    f"selector={best_selector} | cv_rmse={best_score}{suffix}"
+                )
+            else:
+                print(
+                    f"[groupml]   best for {group_key}: model={best_model} | "
+                    f"selector={best_selector} | cv_score={best_score}{suffix}"
+                )
+            return
+        if event_name == "group_model_selected":
+            group_key = str(event.get("group_key", ""))
+            selected = str(event.get("selected_config", ""))
+            model, selector = _split_candidate_label(selected)
+            group_cv = _format_score(event.get("group_cv_mean"), positive_rmse=rmse_display)
+            test_rows = int(event.get("group_test_rows", 0) or 0)
+            if test_rows > 0:
+                test_score = _format_score(event.get("group_test_score"), positive_rmse=rmse_display)
+                metric_name = str(event.get("group_test_metric", "test_score")).strip().lower()
+                if rmse_display and metric_name == "rmse":
+                    print(
+                        f"[groupml]   final for {group_key}: model={model} | selector={selector} "
+                        f"| cv_rmse={group_cv} | test_rmse={test_score} | test_rows={test_rows}"
+                    )
+                else:
+                    print(
+                        f"[groupml]   final for {group_key}: model={model} | selector={selector} "
+                        f"| cv_score={group_cv} | test_score={test_score} | test_rows={test_rows}"
+                    )
+            else:
+                print(
+                    f"[groupml]   final for {group_key}: model={model} | selector={selector} "
+                    f"| cv_score={group_cv} | test_score=n/a (no test rows)"
+                )
+            return
+        if event_name == "group_split_shared_best":
+            method = str(event.get("method_type", "per_group_models"))
+            variant = str(event.get("variant", ""))
+            model = str(event.get("model", ""))
+            selector = str(event.get("selector", ""))
+            cv_mean = _format_score(event.get("cv_mean"), positive_rmse=rmse_display)
+            test_score = _format_score(event.get("test_score"), positive_rmse=rmse_display)
+            if rmse_display:
+                print(
+                    f"[groupml] {method} ({variant}) shared-config best | model={model} | selector={selector} "
+                    f"| cv_rmse={cv_mean} | test_rmse={test_score}"
+                )
+            else:
+                print(
+                    f"[groupml] {method} ({variant}) shared-config best | model={model} | selector={selector} "
+                    f"| cv_score={cv_mean} | test_score={test_score}"
+                )
+            return
+        if event_name == "group_split_variant_finished":
+            method = str(event.get("method_type", "per_group_models"))
+            variant = str(event.get("variant", ""))
+            unique_configs = int(event.get("unique_selected_config_count", 0) or 0)
+            fallback = str(event.get("fallback_config", ""))
+            cv_mean = _format_score(event.get("cv_mean"), positive_rmse=rmse_display)
+            test_score = _format_score(event.get("test_score"), positive_rmse=rmse_display)
+            shared_model = str(event.get("shared_best_model", ""))
+            shared_selector = str(event.get("shared_best_selector", ""))
+            shared_cv = _format_score(event.get("shared_best_cv_mean"), positive_rmse=rmse_display)
+            if rmse_display:
+                print(
+                    f"[groupml] {method} ({variant}) done | unique_group_configs={unique_configs} "
+                    f"| fallback={fallback} | optimized_cv_rmse={cv_mean} | optimized_test_rmse={test_score} "
+                    f"| shared_best={shared_model}/{shared_selector} ({shared_cv})"
+                )
+            else:
+                print(
+                    f"[groupml] {method} ({variant}) done | unique_group_configs={unique_configs} "
+                    f"| fallback={fallback} | optimized_cv_score={cv_mean} | optimized_test_score={test_score} "
+                    f"| shared_best={shared_model}/{shared_selector} ({shared_cv})"
+                )
+            return
         if event_name == "experiment_completed":
             done = int(event.get("completed_experiments", 0))
             total = int(event.get("total_experiments", 0))
             mode = event.get("mode", "unknown")
+            if str(mode) in {"group_split", "group_permutations"} and str(event.get("model")) != "per_group_best":
+                return
             mode_label = str(event.get("method_type", MODE_LABELS.get(str(mode), str(mode))))
             model = event.get("model", "unknown")
             selector = event.get("selector", "unknown")
@@ -565,7 +781,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print()
         if "workbook" in bundle_outputs:
             print(f"Saved report workbook: {bundle_outputs['workbook']}")
-            print("Workbook sheets: summary, recommendations, warnings, all_runs, raw_results")
+            print("Workbook sheets: summary, recommendations, all_runs, raw_results, warnings")
         else:
             if "summary" in bundle_outputs:
                 print(f"Saved summary: {bundle_outputs['summary']}")

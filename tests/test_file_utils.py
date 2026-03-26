@@ -11,6 +11,7 @@ from groupml import (
     compare_group_strategies_file,
     default_report_filename,
     default_summary_filename,
+    excel_export_available,
     export_reporting_bundle,
     export_raw_report,
     export_report,
@@ -228,3 +229,21 @@ def test_export_reporting_bundle_uses_all_runs_with_failed_rows(tmp_path: Path) 
     written_runs = pd.read_csv(runs_path)
     assert "run_status" in written_runs.columns
     assert "failed" in set(written_runs["run_status"].astype(str))
+
+
+def test_export_reporting_bundle_excel_keeps_warnings_as_last_sheet(tmp_path: Path) -> None:
+    if not excel_export_available():
+        pytest.skip("openpyxl is not available")
+
+    leaderboard = pd.DataFrame(
+        [{"experiment_name": "full:all_features", "mode": "full", "cv_mean": 0.1, "test_score": 0.2}]
+    )
+    from groupml.result import GroupMLResult
+
+    result = GroupMLResult(leaderboard=leaderboard, recommendation="ok", warnings=["synthetic warning"])
+    outputs = export_reporting_bundle(result, tmp_path / "bundle.xlsx", report_format="excel")
+    workbook_path = outputs["workbook"]
+    with pd.ExcelFile(workbook_path) as xls:
+        sheet_names = list(xls.sheet_names)
+    assert sheet_names
+    assert sheet_names[-1] == "warnings"

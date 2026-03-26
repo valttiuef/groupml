@@ -94,6 +94,7 @@ def test_cli_main_parses_arguments(monkeypatch) -> None:
     assert cfg.experiment_modes == ["full", "group_split"]
     assert cfg.models == "trees"
     assert cfg.feature_selectors == "mutual_info"
+    assert cfg.kbest_features == "auto"
     assert cfg.cv == 3
     assert cfg.warning_verbosity == "all"
     assert cfg.cv_fold_size_rows is None
@@ -162,6 +163,63 @@ def test_cli_main_parses_cv_fold_size_rows(monkeypatch) -> None:
     assert isinstance(cfg, GroupMLConfig)
     assert cfg.cv_fold_size_rows == 36
     assert cfg.warning_verbosity == "quiet"
+
+
+def test_cli_main_parses_kbest_features(monkeypatch) -> None:
+    from groupml import cli
+
+    captured: dict[str, object] = {}
+
+    def _fake_fit_evaluate_file(
+        path: str,
+        config: GroupMLConfig,
+        callbacks: object = None,
+        **read_kwargs: object,
+    ) -> GroupMLResult:
+        captured["path"] = path
+        captured["config"] = config
+        captured["callbacks"] = callbacks
+        captured["read_kwargs"] = read_kwargs
+        leaderboard = pd.DataFrame(
+            [
+                {
+                    "experiment_name": "full::linear::none",
+                    "mode": "full",
+                    "cv_mean": 0.9,
+                    "test_score": 0.8,
+                }
+            ]
+        )
+        return GroupMLResult(
+            leaderboard=leaderboard,
+            recommendation="Use full",
+            best_experiment=leaderboard.iloc[0].to_dict(),
+            baseline_experiment=leaderboard.iloc[0].to_dict(),
+        )
+
+    monkeypatch.setattr(cli, "fit_evaluate_file", _fake_fit_evaluate_file)
+    monkeypatch.setattr(
+        cli,
+        "export_reporting_bundle",
+        lambda result, path, top_n=10, report_format="auto", include_raw=True: {"summary": Path(path)},
+    )
+    monkeypatch.setattr(cli, "default_summary_filename", lambda ext=".csv": f"default_name{ext}")
+
+    exit_code = cli.main(
+        [
+            "--path",
+            "data.csv",
+            "--target",
+            "Target",
+            "--kbest-features",
+            "9",
+        ]
+    )
+
+    assert exit_code == 0
+    cfg = captured["config"]
+    assert isinstance(cfg, GroupMLConfig)
+    assert cfg.kbest_features == 9
 
 
 def test_cli_main_parses_cv_columns(monkeypatch) -> None:

@@ -36,6 +36,7 @@ class GroupMLConfig:
     )
     models: str | Sequence[Any] | dict[str, Any] = "default_fast"
     feature_selectors: str | Sequence[Any] | dict[str, Any] = "default_fast"
+    kbest_features: int | Literal["auto"] = "auto"
     cv: int | str | dict[str, Any] | Any = 5
     cv_params: dict[str, Any] = field(default_factory=dict)
     cv_fold_size_rows: int | None = None
@@ -75,6 +76,12 @@ class GroupMLConfig:
             raise ValueError("test_size must be in (0, 1).")
         if self.min_group_size < 1:
             raise ValueError("min_group_size must be >= 1.")
+        if isinstance(self.kbest_features, str):
+            if self.kbest_features.strip().lower() != "auto":
+                raise ValueError("kbest_features must be a positive integer or 'auto'.")
+            self.kbest_features = "auto"
+        elif not isinstance(self.kbest_features, int) or self.kbest_features < 1:
+            raise ValueError("kbest_features must be a positive integer or 'auto'.")
         if self.cv is None:
             raise ValueError("cv must be an int or a splitter with .split.")
         if not isinstance(self.cv_params, dict):
