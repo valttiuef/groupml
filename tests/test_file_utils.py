@@ -11,6 +11,7 @@ from groupml import (
     compare_group_strategies_file,
     default_report_filename,
     default_summary_filename,
+    export_reporting_bundle,
     export_raw_report,
     export_report,
     export_summary,
@@ -26,6 +27,24 @@ def test_load_tabular_data_csv(tmp_path: Path) -> None:
     loaded = load_tabular_data(input_path)
     assert list(loaded.columns) == ["x", "y"]
     assert loaded.shape == (2, 2)
+
+
+def test_load_tabular_data_csv_falls_back_from_utf8_to_cp1252(tmp_path: Path) -> None:
+    input_path = tmp_path / "ansi.csv"
+    input_path.write_bytes("name,value\nM\xe4nty,1\n".encode("latin-1"))
+
+    loaded = load_tabular_data(input_path)
+    assert list(loaded.columns) == ["name", "value"]
+    assert loaded.loc[0, "name"] == "Mänty"
+    assert loaded.loc[0, "value"] == 1
+
+
+def test_load_tabular_data_csv_with_explicit_encoding_does_not_fallback(tmp_path: Path) -> None:
+    input_path = tmp_path / "ansi.csv"
+    input_path.write_bytes("name,value\nM\xe4nty,1\n".encode("latin-1"))
+
+    with pytest.raises(UnicodeDecodeError):
+        load_tabular_data(input_path, encoding="utf-8")
 
 
 def test_load_tabular_data_excel_uses_pandas(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -189,3 +208,23 @@ def test_default_summary_filename_has_expected_shape() -> None:
     value = default_summary_filename(prefix="demo_summary", ext=".csv")
     assert value.startswith("demo_summary_")
     assert value.endswith(".csv")
+
+
+def test_export_reporting_bundle_uses_all_runs_with_failed_rows(tmp_path: Path) -> None:
+    leaderboard = pd.DataFrame(
+        [{"experiment_name": "full:all_features", "mode": "full", "cv_mean": 0.1, "test_score": 0.2}]
+    )
+    all_runs = pd.DataFrame(
+        [
+            {"experiment_name": "full:all_features", "mode": "full", "cv_mean": 0.1, "run_status": "ok"},
+            {"experiment_name": "group_split:A", "mode": "group_split", "cv_mean": float("nan"), "run_status": "failed"},
+        ]
+    )
+    from groupml.result import GroupMLResult
+
+    result = GroupMLResult(leaderboard=leaderboard, recommendation="ok", all_runs=all_runs)
+    outputs = export_reporting_bundle(result, tmp_path / "bundle.csv", report_format="csv")
+    runs_path = outputs["all_runs"]
+    written_runs = pd.read_csv(runs_path)
+    assert "run_status" in written_runs.columns
+    assert "failed" in set(written_runs["run_status"].astype(str))

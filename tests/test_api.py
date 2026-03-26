@@ -87,8 +87,11 @@ def test_result_contains_default_raw_report() -> None:
     assert not result.raw_report.empty
     assert "split_assignment" in result.raw_report.columns
     assert "actual" in result.raw_report.columns
-    assert "predicted" in result.raw_report.columns
-    assert "error" in result.raw_report.columns
+    assert any(col.startswith("predicted_") for col in result.raw_report.columns)
+    assert any(col.startswith("error_") for col in result.raw_report.columns)
+    assert "run_datetime" in result.leaderboard.columns
+    assert isinstance(result.split_info.get("run_datetime"), str)
+    assert result.split_info.get("run_datetime")
 
 
 def test_summary_tables_include_best_configs_and_group_performance() -> None:
@@ -108,6 +111,25 @@ def test_summary_tables_include_best_configs_and_group_performance() -> None:
     assert not tables["best_method_configs"].empty
     assert "group_performance" in tables
     assert not tables["group_performance"].empty
+
+
+def test_per_group_summary_rows_do_not_reuse_dataset_cv_or_test_scores() -> None:
+    df = _sample_df(n=220, seed=29)
+    config = GroupMLConfig(
+        target="Target",
+        group_columns=["ActionGroup"],
+        experiment_modes=["full", "group_as_features", "group_split"],
+        models=[LinearRegression()],
+        feature_selectors=["none"],
+        cv=3,
+    )
+    result = GroupMLRunner(config).fit_evaluate(df)
+    summary = build_summary_tables(result)["summary"]
+    per_group = summary[summary["section"] == "per_group_comparison"]
+
+    assert not per_group.empty
+    assert per_group["cv_mean"].isna().all()
+    assert per_group["test_score"].isna().all()
 
 
 def test_summary_tables_group_performance_handles_non_string_group_values() -> None:
@@ -169,7 +191,7 @@ def test_runner_includes_method_type_label_for_full_mode() -> None:
     assert set(result.leaderboard["method_type"]) == {"no_group_awareness"}
 
 
-def test_summary_recommendations_focus_on_recommended_setup_and_top_n() -> None:
+def test_summary_recommendations_are_simple_ranked_list() -> None:
     df = _sample_df(n=180, seed=17)
     config = GroupMLConfig(
         target="Target",
@@ -184,10 +206,46 @@ def test_summary_recommendations_focus_on_recommended_setup_and_top_n() -> None:
     recommendations = tables["recommendations"]
 
     assert not recommendations.empty
-    assert set(recommendations["recommendation_scope"]).issubset({"recommended_setup", "top_n_overall"})
-    assert int((recommendations["recommendation_scope"] == "recommended_setup").sum()) == 1
-    assert int((recommendations["recommendation_scope"] == "top_n_overall").sum()) <= 3
-    assert "recommendation" in recommendations.columns
+    assert "recommend_rank" in recommendations.columns
+    assert "method" in recommendations.columns
+    assert "experiment_name" in recommendations.columns
+    assert list(recommendations["recommend_rank"]) == list(range(1, len(recommendations) + 1))
+    assert len(recommendations) <= 3
+
+
+def test_warning_table_includes_datetime_and_run_columns() -> None:
+    leaderboard = pd.DataFrame(
+        [
+            {
+                "experiment_name": "full:all_features",
+                "mode": "full",
+                "model": "linear_regression",
+                "selector": "none",
+                "cv_mean": 0.1,
+                "test_score": 0.2,
+            }
+        ]
+    )
+    warning_details = pd.DataFrame(
+        [
+            {
+                "warning_datetime": "2026-03-25T18:00:00+02:00",
+                "run_datetime": "2026-03-25T18:00:00+02:00",
+                "run_experiment": "full:all_features",
+                "warning": "Test warning",
+            }
+        ]
+    )
+    result = GroupMLResult(
+        leaderboard=leaderboard,
+        recommendation="ok",
+        best_experiment=leaderboard.iloc[0].to_dict(),
+        baseline_experiment=leaderboard.iloc[0].to_dict(),
+        warning_details=warning_details,
+    )
+    tables = build_summary_tables(result)
+    warnings = tables["warnings"]
+    assert {"warning_datetime", "run_datetime", "run_experiment", "warning"}.issubset(warnings.columns)
 
 
 def test_group_performance_avoids_row_level_high_cardinality_columns() -> None:

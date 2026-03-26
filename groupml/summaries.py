@@ -25,19 +25,25 @@ def _fmt(value: Any, digits: int = 5) -> str:
     return f"{number:.{digits}f}"
 
 
-def _best_by_average(leaderboard: pd.DataFrame, column: str) -> dict[str, Any]:
+def _cv_prefers_lower(result: "GroupMLResult") -> bool:
+    scorer = str((result.split_info or {}).get("scorer", "")).strip().lower()
+    return scorer in {"rmse", "neg_root_mean_squared_error", "root_mean_squared_error"}
+
+
+def _best_by_average(leaderboard: pd.DataFrame, column: str, prefers_lower: bool) -> dict[str, Any]:
     if leaderboard.empty or column not in leaderboard.columns:
         return {}
+    best_agg = "min" if prefers_lower else "max"
     stats = (
         leaderboard.groupby(column, dropna=False)
         .agg(
             avg_cv_mean=("cv_mean", "mean"),
             avg_test_score=("test_score", "mean"),
-            best_cv_mean=("cv_mean", "max"),
+            best_cv_mean=("cv_mean", best_agg),
             runs=(column, "size"),
         )
         .reset_index()
-        .sort_values(by=["avg_cv_mean", "best_cv_mean"], ascending=False)
+        .sort_values(by=["avg_cv_mean", "best_cv_mean"], ascending=prefers_lower)
     )
     if stats.empty:
         return {}
@@ -84,20 +90,13 @@ METHOD_ORDER = [
 ]
 
 RECOMMENDATION_COLUMNS = [
-    "recommendation_scope",
-    "rank",
-    "group_column",
-    "group_value",
-    "method_type",
-    "mode",
+    "recommend_rank",
+    "method",
     "experiment_name",
     "model",
     "selector",
     "cv_mean",
     "test_score",
-    "metric_name",
-    "metric_value",
-    "recommendation",
     "notes",
 ]
 
@@ -106,25 +105,31 @@ def _empty_summary_table() -> pd.DataFrame:
     return pd.DataFrame(columns=SUMMARY_COLUMNS)
 
 
-def _best_by_mode(leaderboard: pd.DataFrame) -> dict[str, dict[str, Any]]:
+def _best_by_mode(leaderboard: pd.DataFrame, prefers_lower: bool) -> dict[str, dict[str, Any]]:
     if leaderboard.empty:
         return {}
     if "mode" not in leaderboard.columns:
         return {}
-    ordered = leaderboard.sort_values(by=["cv_mean"], ascending=False)
+    ordered = leaderboard.sort_values(by=["cv_mean"], ascending=prefers_lower)
     rows = ordered.drop_duplicates(subset=["mode"], keep="first")
     return {str(row["mode"]): row for row in rows.to_dict(orient="records")}
 
 
-def _resolve_group_columns(result: "GroupMLResult", raw_report: pd.DataFrame) -> list[str]:
+def _resolve_group_columns(
+    result: "GroupMLResult",
+    raw_report: pd.DataFrame,
+    filtered_eval_rows: pd.DataFrame,
+) -> list[str]:
     split_info = result.split_info if isinstance(result.split_info, dict) else {}
     configured_cols = list(split_info.get("configured_group_columns", []) or [])
-    configured_cols = [c for c in configured_cols if c in raw_report.columns]
+    configured_cols = [c for c in configured_cols if c in filtered_eval_rows.columns]
+    configured_cols = [c for c in configured_cols if filtered_eval_rows[c].notna().any()]
     if configured_cols:
         return configured_cols
 
     split_cols = list((split_info.get("cv", {}) or {}).get("group_columns", []) or [])
-    split_cols = [c for c in split_cols if c in raw_report.columns]
+    split_cols = [c for c in split_cols if c in filtered_eval_rows.columns]
+    split_cols = [c for c in split_cols if filtered_eval_rows[c].notna().any()]
     if split_cols:
         return split_cols
 
@@ -144,18 +149,21 @@ def _resolve_group_columns(result: "GroupMLResult", raw_report: pd.DataFrame) ->
     excluded.update({c for c in raw_report.columns if c.startswith("predicted_") or c.startswith("error_")})
     candidates = [
         c
-        for c in raw_report.columns
+        for c in filtered_eval_rows.columns
         if c not in excluded and not str(c).startswith("__groupml_auto_stratify__")
     ]
     out: list[str] = []
-    max_cardinality = max(2, min(20, int(len(raw_report) * 0.2)))
+    max_cardinality = max(2, min(20, int(len(filtered_eval_rows) * 0.2)))
     for col in candidates:
-        unique_count = raw_report[col].nunique(dropna=False)
+        series = filtered_eval_rows[col].dropna()
+        if series.empty:
+            continue
+        unique_count = series.nunique(dropna=True)
         if unique_count <= 1:
             continue
         if unique_count > max_cardinality:
             continue
-        if pd.api.types.is_numeric_dtype(raw_report[col]):
+        if pd.api.types.is_numeric_dtype(filtered_eval_rows[col]):
             continue
         out.append(col)
     return out
@@ -207,19 +215,22 @@ def _build_per_group_rows(
     ]
     if not predicted_cols:
         return []
-    group_cols = _resolve_group_columns(result, raw_report)
+    eval_mask = raw_report.get("split_assignment", pd.Series([""] * len(raw_report))).astype(str) != "train"
+    eval_rows = raw_report.loc[eval_mask].copy()
+    eval_rows = eval_rows[eval_rows["actual"].notna()]
+    eval_rows = eval_rows[eval_rows[predicted_cols].notna().any(axis=1)]
+
+    group_cols = _resolve_group_columns(result, raw_report, eval_rows)
     if not group_cols:
         return []
-
-    eval_mask = raw_report.get("split_assignment", pd.Series([""] * len(raw_report))).astype(str) != "train"
     output: list[dict[str, Any]] = []
     for pred_col in sorted(predicted_cols):
         method_type = pred_col.replace("predicted_", "", 1)
         mapped_mode = METHOD_TYPE_TO_MODE.get(method_type, "")
         best_row = best_mode_map.get(mapped_mode, {})
 
-        subset = raw_report.loc[eval_mask, ["actual", pred_col] + group_cols].copy()
-        subset = subset.dropna(subset=[pred_col])
+        subset = eval_rows.loc[:, ["actual", pred_col] + group_cols].copy()
+        subset = subset.dropna(subset=[pred_col, "actual"])
         if subset.empty:
             continue
 
@@ -259,7 +270,8 @@ def _build_per_group_rows(
             )
 
         for group_col in group_cols:
-            for group_value, group_df in subset.groupby(group_col, dropna=False):
+            grouped = subset.dropna(subset=[group_col])
+            for group_value, group_df in grouped.groupby(group_col, dropna=True):
                 n_eval = int(len(group_df))
                 if n_eval == 0:
                     continue
@@ -270,7 +282,7 @@ def _build_per_group_rows(
                     metric_value = float(np.sqrt(np.mean(np.square(err))))
                 else:
                     metric_value = float((group_df[pred_col] == group_df["actual"]).mean())
-                group_value_str = "" if pd.isna(group_value) else str(group_value)
+                group_value_str = str(group_value)
                 output.append(
                     {
                         "section": "per_group_comparison",
@@ -284,12 +296,12 @@ def _build_per_group_rows(
                         "experiment_name": best_row.get("experiment_name", ""),
                         "model": best_row.get("model", ""),
                         "selector": best_row.get("selector", ""),
-                        "cv_mean": _safe_float(best_row.get("cv_mean")),
-                        "test_score": _safe_float(best_row.get("test_score")),
+                        "cv_mean": np.nan,
+                        "test_score": np.nan,
                         "n_eval_rows": n_eval,
                         "metric_name": metric_name,
                         "metric_value": metric_value,
-                        "notes": "",
+                        "notes": "Per-group metric_value computed on eval predictions for this group.",
                     }
                 )
     return output
@@ -301,49 +313,20 @@ def _build_recommendation_table(
     top_n: int,
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
-    best_experiment = result.best_experiment or {}
-    if best_experiment:
-        best_mode = str(best_experiment.get("mode", ""))
-        rows.append(
-            {
-                "recommendation_scope": "recommended_setup",
-                "rank": 1,
-                "group_column": "",
-                "group_value": "ALL",
-                "method_type": MODE_TO_METHOD_TYPE.get(best_mode, best_mode),
-                "mode": best_mode,
-                "experiment_name": best_experiment.get("experiment_name", ""),
-                "model": best_experiment.get("model", ""),
-                "selector": best_experiment.get("selector", ""),
-                "cv_mean": _safe_float(best_experiment.get("cv_mean")),
-                "test_score": _safe_float(best_experiment.get("test_score")),
-                "metric_name": "cv_mean",
-                "metric_value": _safe_float(best_experiment.get("cv_mean")),
-                "recommendation": str(result.recommendation),
-                "notes": "Chosen using CV-first ranking. Test is display-only.",
-            }
-        )
     if not leaderboard.empty:
         top_rows = leaderboard.head(max(1, int(top_n)))
         for rank, (_, row) in enumerate(top_rows.iterrows(), start=1):
             mode = str(row.get("mode", ""))
             rows.append(
                 {
-                    "recommendation_scope": "top_n_overall",
-                    "rank": rank,
-                    "group_column": "",
-                    "group_value": "ALL",
-                    "method_type": MODE_TO_METHOD_TYPE.get(mode, mode),
-                    "mode": mode,
+                    "recommend_rank": rank,
+                    "method": MODE_TO_METHOD_TYPE.get(mode, mode),
                     "experiment_name": row.get("experiment_name", ""),
                     "model": row.get("model", ""),
                     "selector": row.get("selector", ""),
                     "cv_mean": _safe_float(row.get("cv_mean")),
                     "test_score": _safe_float(row.get("test_score")),
-                    "metric_name": "cv_mean",
-                    "metric_value": _safe_float(row.get("cv_mean")),
-                    "recommendation": "",
-                    "notes": "Ranked by CV only. Test is display-only.",
+                    "notes": str(result.recommendation) if rank == 1 else "",
                 }
             )
     if not rows:
@@ -369,6 +352,7 @@ def build_summary_payload(result: "GroupMLResult", top_n: int = 5) -> dict[str, 
         }
 
     best_experiment = dict(result.best_experiment or leaderboard.iloc[0].to_dict())
+    prefers_lower = _cv_prefers_lower(result)
 
     if result.baseline_experiment:
         baseline_experiment = dict(result.baseline_experiment)
@@ -378,23 +362,26 @@ def build_summary_payload(result: "GroupMLResult", top_n: int = 5) -> dict[str, 
             baseline_experiment = leaderboard.iloc[0].to_dict()
         else:
             baseline_experiment = baseline_rows.sort_values(
-                by=["cv_mean"], ascending=False
+                by=["cv_mean"], ascending=prefers_lower
             ).iloc[0].to_dict()
 
-    cv_improvement_vs_baseline = _safe_float(best_experiment.get("cv_mean")) - _safe_float(
-        baseline_experiment.get("cv_mean")
-    )
+    best_cv = _safe_float(best_experiment.get("cv_mean"))
+    baseline_cv = _safe_float(baseline_experiment.get("cv_mean"))
+    cv_improvement_vs_baseline = (baseline_cv - best_cv) if prefers_lower else (best_cv - baseline_cv)
 
     top_rows = leaderboard.head(max(1, top_n))
     top_experiments = top_rows.to_dict(orient="records")
+    run_datetime = str(best_experiment.get("run_datetime") or result.split_info.get("run_datetime", ""))
 
     return {
         "best_experiment": best_experiment,
         "baseline_experiment": baseline_experiment,
+        "run_datetime": run_datetime,
+        "cv_prefers_lower": prefers_lower,
         "cv_improvement_vs_baseline": cv_improvement_vs_baseline,
-        "best_grouping_method": _best_by_average(leaderboard, "mode"),
-        "best_model": _best_by_average(leaderboard, "model"),
-        "best_feature_selector": _best_by_average(leaderboard, "selector"),
+        "best_grouping_method": _best_by_average(leaderboard, "mode", prefers_lower=prefers_lower),
+        "best_model": _best_by_average(leaderboard, "model", prefers_lower=prefers_lower),
+        "best_feature_selector": _best_by_average(leaderboard, "selector", prefers_lower=prefers_lower),
         "top_experiments": top_experiments,
         "recommendation": result.recommendation,
         "warnings": list(result.warnings),
@@ -412,6 +399,7 @@ def build_summary_tables(result: "GroupMLResult", top_n: int = 10) -> dict[str, 
     selector = payload["best_feature_selector"]
 
     overview_rows = [
+        {"metric": "run_datetime", "value": payload.get("run_datetime", "")},
         {"metric": "best_experiment", "value": best.get("experiment_name", "")},
         {"metric": "best_mode", "value": best.get("mode", "")},
         {"metric": "best_model", "value": best.get("model", "")},
@@ -439,19 +427,20 @@ def build_summary_tables(result: "GroupMLResult", top_n: int = 10) -> dict[str, 
     }
 
     leaderboard = result.leaderboard
-    best_mode_map = _best_by_mode(leaderboard)
+    prefers_lower = bool(payload.get("cv_prefers_lower", False))
+    best_mode_map = _best_by_mode(leaderboard, prefers_lower=prefers_lower)
     if not leaderboard.empty and "mode" in leaderboard.columns:
         tables["by_mode"] = (
             leaderboard.groupby("mode", dropna=False)
             .agg(avg_cv_mean=("cv_mean", "mean"), avg_test_score=("test_score", "mean"), runs=("mode", "size"))
-            .sort_values(by=["avg_cv_mean"], ascending=False)
+            .sort_values(by=["avg_cv_mean"], ascending=prefers_lower)
             .reset_index()
         )
         if "model" in leaderboard.columns:
             tables["by_model"] = (
                 leaderboard.groupby("model", dropna=False)
                 .agg(avg_cv_mean=("cv_mean", "mean"), avg_test_score=("test_score", "mean"), runs=("model", "size"))
-                .sort_values(by=["avg_cv_mean"], ascending=False)
+                .sort_values(by=["avg_cv_mean"], ascending=prefers_lower)
                 .reset_index()
             )
         if "selector" in leaderboard.columns:
@@ -462,11 +451,11 @@ def build_summary_tables(result: "GroupMLResult", top_n: int = 10) -> dict[str, 
                     avg_test_score=("test_score", "mean"),
                     runs=("selector", "size"),
                 )
-                .sort_values(by=["avg_cv_mean"], ascending=False)
+                .sort_values(by=["avg_cv_mean"], ascending=prefers_lower)
                 .reset_index()
             )
         best_by_mode = (
-            leaderboard.sort_values(by=["cv_mean"], ascending=False)
+            leaderboard.sort_values(by=["cv_mean"], ascending=prefers_lower)
             .drop_duplicates(subset=["mode"], keep="first")
             .loc[
                 :,
@@ -518,8 +507,18 @@ def build_summary_tables(result: "GroupMLResult", top_n: int = 10) -> dict[str, 
                 .reset_index(drop=True)
             )
 
-    if payload["warnings"]:
-        tables["warnings"] = pd.DataFrame({"warning": payload["warnings"]})
+    warning_details = result.warning_details if isinstance(result.warning_details, pd.DataFrame) else pd.DataFrame()
+    if not warning_details.empty:
+        tables["warnings"] = warning_details.copy()
+    elif payload["warnings"]:
+        tables["warnings"] = pd.DataFrame(
+            {
+                "warning_datetime": [str(result.split_info.get("run_datetime", ""))] * len(payload["warnings"]),
+                "run_datetime": [str(result.split_info.get("run_datetime", ""))] * len(payload["warnings"]),
+                "run_experiment": [""] * len(payload["warnings"]),
+                "warning": payload["warnings"],
+            }
+        )
 
     return tables
 

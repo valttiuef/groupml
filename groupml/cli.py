@@ -333,11 +333,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     partial_total_experiments = 0
     partial_completed_experiments = 0
     partial_best_raw_report = pd.DataFrame()
+    partial_run_datetime = ""
 
     def _capture_progress_callback(event: dict[str, object]) -> None:
-        nonlocal partial_total_experiments, partial_completed_experiments, partial_split_info, partial_best_raw_report
+        nonlocal partial_total_experiments, partial_completed_experiments, partial_split_info, partial_best_raw_report, partial_run_datetime
         event_name = event.get("event")
         if event_name == "run_started":
+            partial_run_datetime = str(event.get("run_datetime", "") or "")
             try:
                 partial_total_experiments = int(event.get("total_experiments", 0))
             except (TypeError, ValueError):
@@ -363,8 +365,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "fold_size_rows": event.get("cv_fold_size_rows"),
                     "n_splits_derived_from_fold_size": event.get("cv_n_splits_derived_from_fold_size"),
                     "scorer": event.get("scorer"),
-                }
+                },
+                "preprocessing": event.get("preprocessing", {}),
+                "group_profile": event.get("group_profile", {}),
             }
+            if partial_run_datetime:
+                partial_split_info["run_datetime"] = partial_run_datetime
             return
         if event_name == "experiment_completed":
             try:
@@ -382,6 +388,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "experiment_name": experiment_name,
                     "model": event.get("model", "unknown"),
                     "selector": event.get("selector", "unknown"),
+                    "run_datetime": event.get("run_datetime", partial_run_datetime),
                     "cv_mean": event.get("cv_mean", float("nan")),
                     "cv_std": event.get("cv_std", float("nan")),
                     "cv_folds_ok": event.get("cv_folds_ok", float("nan")),
@@ -410,6 +417,37 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"[groupml] Running {total} experiment(s) | cv={splitter} "
                 f"(strategy={strategy}, folds={folds}{fold_size_suffix}){inferred}"
             )
+            preprocessing = event.get("preprocessing", {})
+            if isinstance(preprocessing, dict) and preprocessing:
+                print(
+                    "[groupml] Preprocess rows: "
+                    f"initial={preprocessing.get('rows_initial')} | "
+                    f"after_target={preprocessing.get('rows_after_target_filters')} | "
+                    f"after_dropna={preprocessing.get('rows_after_dropna')} | "
+                    f"after_comparability={preprocessing.get('rows_after_comparability')}"
+                )
+                print(
+                    "[groupml] Preprocess drops: "
+                    f"min_target={preprocessing.get('rows_dropped_min_target', 0)} | "
+                    f"max_target={preprocessing.get('rows_dropped_max_target', 0)} | "
+                    f"required_na={preprocessing.get('rows_dropped_required_na', 0)} | "
+                    f"group_comparability={preprocessing.get('rows_dropped_group_comparability', 0)}"
+                )
+                print(
+                    "[groupml] Preprocess features: "
+                    f"initial={preprocessing.get('columns_initial_features')} | "
+                    f"removed_static={preprocessing.get('columns_removed_static')} | "
+                    f"final={preprocessing.get('columns_final_features')}"
+                )
+            group_profile = event.get("group_profile", {})
+            if isinstance(group_profile, dict) and group_profile.get("group_columns"):
+                print(
+                    "[groupml] Groups: "
+                    f"columns={group_profile.get('group_columns')} | "
+                    f"unique_per_column={group_profile.get('unique_groups_per_column', {})} | "
+                    f"unique_combinations={group_profile.get('unique_group_combinations')} | "
+                    f"min_group_size={group_profile.get('min_group_size')}"
+                )
             if bool(event.get("cv_n_splits_derived_from_fold_size")):
                 fold_size = event.get("cv_fold_size_rows")
                 print(f"[groupml] CV folds derived from cv_fold_size_rows={fold_size}: using n_splits={folds}")
@@ -459,11 +497,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         leaderboard = pd.DataFrame(partial_rows)
         if not leaderboard.empty:
-            leaderboard = leaderboard.sort_values(by=["cv_mean"], ascending=False).reset_index(drop=True)
+            leaderboard = leaderboard.sort_values(by=["cv_mean"], ascending=rmse_display).reset_index(drop=True)
             best = leaderboard.iloc[0].to_dict()
             baseline_rows = leaderboard[leaderboard["mode"] == "full"]
             baseline = (
-                baseline_rows.sort_values(by=["cv_mean"], ascending=False).iloc[0].to_dict()
+                baseline_rows.sort_values(by=["cv_mean"], ascending=rmse_display).iloc[0].to_dict()
                 if not baseline_rows.empty
                 else best
             )
@@ -474,6 +512,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"Completed {partial_completed_experiments}/{partial_total_experiments} experiments before interruption."
         )
         partial_warnings.append(progress_note)
+        run_datetime_value = str(partial_split_info.get("run_datetime", ""))
+        warning_details = pd.DataFrame(
+            {
+                "warning_datetime": [run_datetime_value] * len(partial_warnings),
+                "run_datetime": [run_datetime_value] * len(partial_warnings),
+                "run_experiment": [""] * len(partial_warnings),
+                "warning": partial_warnings,
+            }
+        )
         result = GroupMLResult(
             leaderboard=leaderboard,
             recommendation=f"Run interrupted. {progress_note}",
@@ -482,6 +529,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             baseline_experiment=baseline,
             split_info=partial_split_info,
             raw_report=partial_best_raw_report,
+            all_runs=leaderboard.copy(),
+            warning_details=warning_details,
         )
         print()
         print(

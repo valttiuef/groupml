@@ -23,7 +23,7 @@ def test_group_aware_example_dataset_prefers_group_strategy() -> None:
     assert result.leaderboard.iloc[0]["mode"] == "group_as_features"
     baseline_cv = float(result.leaderboard[result.leaderboard["mode"] == "full"]["cv_mean"].iloc[0])
     best_cv = float(result.leaderboard.iloc[0]["cv_mean"])
-    assert best_cv > baseline_cv
+    assert best_cv < baseline_cv
 
 
 def test_rule_split_example_dataset_prefers_rule_split() -> None:
@@ -43,4 +43,4 @@ def test_rule_split_example_dataset_prefers_rule_split() -> None:
     assert result.leaderboard.iloc[0]["mode"] == "rule_split"
     baseline_cv = float(result.leaderboard[result.leaderboard["mode"] == "full"]["cv_mean"].iloc[0])
     best_cv = float(result.leaderboard.iloc[0]["cv_mean"])
-    assert best_cv > baseline_cv
+    assert best_cv < baseline_cv

@@ -32,6 +32,22 @@ class _ExplodingPredictionModel(BaseEstimator, RegressorMixin):
         return np.full(shape=(len(X),), fill_value=self.constant_, dtype=float)
 
 
+class _KeepFirstFeatureSelector(BaseEstimator):
+    def fit(self, X, y=None):  # type: ignore[no-untyped-def]
+        del y
+        n_features = int(X.shape[1])
+        self.support_ = np.zeros(n_features, dtype=bool)
+        if n_features > 0:
+            self.support_[0] = True
+        return self
+
+    def transform(self, X):  # type: ignore[no-untyped-def]
+        return X[:, self.support_]
+
+    def get_support(self):  # type: ignore[no-untyped-def]
+        return self.support_
+
+
 def test_base_preprocessing_applies_target_range_dropna_and_static_removal() -> None:
     df = pd.DataFrame(
         {
@@ -122,6 +138,8 @@ def test_rmse_default_and_alias_work() -> None:
     assert default_cfg.scorer == "neg_root_mean_squared_error"
     assert np.isfinite(default_result.leaderboard.iloc[0]["cv_mean"])
     assert np.isfinite(alias_result.leaderboard.iloc[0]["cv_mean"])
+    assert float(default_result.leaderboard.iloc[0]["cv_mean"]) >= 0.0
+    assert float(alias_result.leaderboard.iloc[0]["cv_mean"]) >= 0.0
 
 
 def test_kbest_f_regression_avoids_sparse_invalid_sqrt_warning() -> None:
@@ -222,6 +240,108 @@ def test_unstable_rmse_runs_are_ignored_from_leaderboard_and_averages() -> None:
 
     assert not result.leaderboard.empty
     assert "exploding" not in set(result.leaderboard["model"].tolist())
+    assert not result.all_runs.empty
+    assert "exploding" in set(result.all_runs["model"].tolist())
+    exploding_row = result.all_runs[result.all_runs["model"] == "exploding"].iloc[0]
+    assert exploding_row["run_status"] == "failed"
     joined_warnings = " | ".join(result.warnings)
     assert "invalid or unstable score" in joined_warnings
     assert "Ignored 1 unsuccessful experiment" in joined_warnings
+    assert not result.warning_details.empty
+    assert {"warning_datetime", "run_datetime", "run_experiment", "warning"}.issubset(
+        set(result.warning_details.columns)
+    )
+
+
+def test_group_onehot_features_are_forced_back_after_selection() -> None:
+    n = 80
+    rng = np.random.default_rng(3)
+    df = pd.DataFrame(
+        {
+            "x0": rng.normal(size=n),
+            "ActionGroup": np.where(np.arange(n) % 2 == 0, "A", "B"),
+        }
+    )
+    df["Target"] = 2.0 * df["x0"] + np.where(df["ActionGroup"] == "A", 0.5, -0.5)
+
+    config = GroupMLConfig(
+        target="Target",
+        feature_columns=["x0", "ActionGroup"],
+        group_columns=["ActionGroup"],
+        experiment_modes=["group_as_features"],
+        models=[LinearRegression()],
+        feature_selectors=[_KeepFirstFeatureSelector()],
+        cv=3,
+        random_state=42,
+    )
+    result = GroupMLRunner(config).fit_evaluate(df)
+    row = result.leaderboard.iloc[0]
+
+    assert int(row["group_features_required_count"]) > 0
+    assert int(row["group_features_selected_count"]) == 0
+    assert int(row["group_features_forced_count"]) > 0
+    assert bool(row["group_features_all_selected"]) is False
+
+
+def test_static_all_nan_feature_is_removed_before_dropna() -> None:
+    n = 80
+    x = np.linspace(0.0, 10.0, n)
+    df = pd.DataFrame(
+        {
+            "x_useful": x,
+            "x_all_nan": [np.nan] * n,
+            "Target": 2.0 * x + 1.0,
+        }
+    )
+
+    config = GroupMLConfig(
+        target="Target",
+        feature_columns=["x_useful", "x_all_nan"],
+        experiment_modes=["full"],
+        models=[LinearRegression()],
+        feature_selectors=["none"],
+        cv=3,
+        random_state=42,
+    )
+    result = GroupMLRunner(config).fit_evaluate(df)
+
+    assert not result.leaderboard.empty
+    prep = result.split_info.get("preprocessing", {})
+    assert int(prep.get("rows_initial", 0)) == n
+    assert int(prep.get("rows_dropped_required_na", -1)) == 0
+    assert int(prep.get("columns_removed_static", 0)) >= 1
+
+
+def test_split_info_contains_preprocess_and_group_profile() -> None:
+    n = 90
+    x = np.linspace(0.0, 9.0, n)
+    material = np.where(np.arange(n) % 3 == 0, "A", np.where(np.arange(n) % 3 == 1, "B", "C"))
+    df = pd.DataFrame(
+        {
+            "x": x,
+            "Material": material,
+            "Target": 3.0 * x + 1.0,
+        }
+    )
+
+    config = GroupMLConfig(
+        target="Target",
+        feature_columns=["x", "Material"],
+        group_columns=["Material"],
+        experiment_modes=["full"],
+        models=[LinearRegression()],
+        feature_selectors=["none"],
+        cv=3,
+        random_state=42,
+    )
+    result = GroupMLRunner(config).fit_evaluate(df)
+
+    prep = result.split_info.get("preprocessing", {})
+    group_profile = result.split_info.get("group_profile", {})
+    assert prep
+    assert int(prep.get("rows_initial", 0)) == n
+    assert "rows_after_comparability" in prep
+    assert group_profile
+    assert group_profile.get("group_columns") == ["Material"]
+    unique_per_column = group_profile.get("unique_groups_per_column", {})
+    assert int(unique_per_column.get("Material", 0)) == 3

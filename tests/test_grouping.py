@@ -165,8 +165,8 @@ def test_raw_report_contains_best_predictions_per_method_columns() -> None:
     result = GroupMLRunner(config).fit_evaluate(df)
 
     predicted_columns = [c for c in result.raw_report.columns if c.startswith("predicted_")]
-    assert "prediction_method" in result.raw_report.columns
     assert "predicted_no_group_awareness" in predicted_columns
     assert "predicted_one_hot_group_features" in predicted_columns
     assert "predicted_per_group_models" in predicted_columns
     assert len(predicted_columns) == 3
+    assert result.raw_report[predicted_columns].notna().any(axis=1).all()

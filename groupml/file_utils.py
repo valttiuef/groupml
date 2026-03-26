@@ -16,6 +16,9 @@ from .runner import GroupMLRunner, compare_group_strategies
 from .summaries import build_summary_payload, build_summary_tables, summary_text
 
 
+_CSV_FALLBACK_ENCODINGS: tuple[str, ...] = ("utf-8", "utf-8-sig", "cp1252", "latin-1")
+
+
 def _excel_number_format_for_column(column_name: str) -> str | None:
     lowered = str(column_name).strip().lower()
     if any(
@@ -74,6 +77,18 @@ def load_tabular_data(path: str | Path, **read_kwargs: Any) -> pd.DataFrame:
     file_path = Path(path)
     suffix = file_path.suffix.lower()
     if suffix == ".csv":
+        if "encoding" in read_kwargs and read_kwargs["encoding"] is not None:
+            return pd.read_csv(file_path, **read_kwargs)
+
+        last_error: UnicodeDecodeError | None = None
+        for encoding in _CSV_FALLBACK_ENCODINGS:
+            try:
+                return pd.read_csv(file_path, encoding=encoding, **read_kwargs)
+            except UnicodeDecodeError as exc:
+                last_error = exc
+                continue
+        if last_error is not None:
+            raise last_error
         return pd.read_csv(file_path, **read_kwargs)
     if suffix in {".xls", ".xlsx"}:
         return pd.read_excel(file_path, **read_kwargs)
@@ -283,7 +298,7 @@ def export_reporting_bundle(
     summary_df = summary_tables.get("summary", pd.DataFrame())
     recommendations_df = summary_tables.get("recommendations", pd.DataFrame())
     warnings_df = summary_tables.get("warnings", pd.DataFrame(columns=["warning"]))
-    runs_df = result.leaderboard.copy()
+    runs_df = result.all_runs.copy() if isinstance(result.all_runs, pd.DataFrame) and not result.all_runs.empty else result.leaderboard.copy()
     raw_df = result.raw_report.copy() if include_raw and isinstance(result.raw_report, pd.DataFrame) else pd.DataFrame()
 
     fmt = str(report_format).strip().lower()
