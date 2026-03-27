@@ -64,6 +64,8 @@ class GroupMLConfig:
     min_target: float | None = None
     max_target: float | None = None
     min_group_size: int = 15
+    group_split_compare_shared_candidates: bool = False
+    group_split_tune_candidates_with_cv: bool = False
     min_improvement: float = 0.01
     task: Literal["auto", "regression", "classification"] = "auto"
     warning_verbosity: Literal["quiet", "default", "all"] = "quiet"
@@ -76,6 +78,10 @@ class GroupMLConfig:
             raise ValueError("test_size must be in (0, 1).")
         if self.min_group_size < 1:
             raise ValueError("min_group_size must be >= 1.")
+        if not isinstance(self.group_split_compare_shared_candidates, bool):
+            raise ValueError("group_split_compare_shared_candidates must be a boolean.")
+        if not isinstance(self.group_split_tune_candidates_with_cv, bool):
+            raise ValueError("group_split_tune_candidates_with_cv must be a boolean.")
         if isinstance(self.kbest_features, str):
             if self.kbest_features.strip().lower() != "auto":
                 raise ValueError("kbest_features must be a positive integer or 'auto'.")

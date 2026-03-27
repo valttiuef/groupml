@@ -22,6 +22,21 @@ class _ConvergenceWarningModel(BaseEstimator, RegressorMixin):
         return np.full(shape=(len(X),), fill_value=self.mean_, dtype=float)
 
 
+class _SklearnParallelDelayedWarningModel(BaseEstimator, RegressorMixin):
+    def fit(self, X, y):  # type: ignore[no-untyped-def]
+        del X
+        warnings.warn(
+            "`sklearn.utils.parallel.delayed` should be used with `sklearn.utils.parallel.Parallel` "
+            "to make it possible to propagate the scikit-learn configuration of the current thread to the joblib workers.",
+            UserWarning,
+        )
+        self.mean_ = float(np.mean(y))
+        return self
+
+    def predict(self, X):  # type: ignore[no-untyped-def]
+        return np.full(shape=(len(X),), fill_value=self.mean_, dtype=float)
+
+
 class _ExplodingPredictionModel(BaseEstimator, RegressorMixin):
     def fit(self, X, y):  # type: ignore[no-untyped-def]
         del X, y
@@ -217,6 +232,58 @@ def test_warning_verbosity_all_allows_convergence_warning() -> None:
 
     assert not result.leaderboard.empty
     assert any(isinstance(item.message, ConvergenceWarning) for item in caught)
+
+
+def test_warning_verbosity_default_suppresses_sklearn_parallel_delayed_warning() -> None:
+    n = 50
+    x = np.linspace(0.0, 10.0, n)
+    df = pd.DataFrame({"x": x, "Target": 2.0 * x + 1.0})
+
+    config = GroupMLConfig(
+        target="Target",
+        experiment_modes=["full"],
+        models=[_SklearnParallelDelayedWarningModel()],
+        feature_selectors=["none"],
+        cv=3,
+        random_state=42,
+        warning_verbosity="default",
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", UserWarning)
+        result = GroupMLRunner(config).fit_evaluate(df)
+
+    assert not result.leaderboard.empty
+    assert not any(
+        "`sklearn.utils.parallel.delayed` should be used with `sklearn.utils.parallel.Parallel`" in str(item.message)
+        for item in caught
+    )
+
+
+def test_warning_verbosity_all_allows_sklearn_parallel_delayed_warning() -> None:
+    n = 50
+    x = np.linspace(0.0, 10.0, n)
+    df = pd.DataFrame({"x": x, "Target": 2.0 * x + 1.0})
+
+    config = GroupMLConfig(
+        target="Target",
+        experiment_modes=["full"],
+        models=[_SklearnParallelDelayedWarningModel()],
+        feature_selectors=["none"],
+        cv=3,
+        random_state=42,
+        warning_verbosity="all",
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", UserWarning)
+        result = GroupMLRunner(config).fit_evaluate(df)
+
+    assert not result.leaderboard.empty
+    assert any(
+        "`sklearn.utils.parallel.delayed` should be used with `sklearn.utils.parallel.Parallel`" in str(item.message)
+        for item in caught
+    )
 
 
 def test_unstable_rmse_runs_are_ignored_from_leaderboard_and_averages() -> None:

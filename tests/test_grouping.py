@@ -5,8 +5,10 @@ import pandas as pd
 from sklearn.ensemble import ExtraTreesRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.dummy import DummyRegressor
 
 from groupml import GroupMLConfig, GroupMLRunner
+from groupml.summaries import build_summary_tables
 from groupml.utils import group_column_permutations
 
 
@@ -43,8 +45,9 @@ def test_group_split_mode_produces_rows() -> None:
     assert (result.leaderboard["mode"] == "group_split").any()
     assert (result.leaderboard["mode"] == "group_permutations").any()
     group_split_rows = result.leaderboard[result.leaderboard["mode"] == "group_split"]
-    assert len(group_split_rows) >= 2
+    assert len(group_split_rows) >= 1
     assert (group_split_rows["model"] == "per_group_best").any()
+    assert not (group_split_rows["model"] != "per_group_best").any()
 
 
 def test_group_permutations_skipped_with_single_group_column() -> None:
@@ -305,7 +308,7 @@ def test_group_split_emits_group_level_progress_events() -> None:
 
     assert "group_split_variant_started" in events
     assert "group_model_selected" in events
-    assert "group_split_shared_best" in events
+    assert "group_split_shared_best" not in events
     assert "group_split_variant_finished" in events
 
 
@@ -329,6 +332,7 @@ def test_group_split_shared_candidates_include_test_score() -> None:
         feature_selectors=["none"],
         cv=3,
         test_size=0.2,
+        group_split_compare_shared_candidates=True,
     )
     result = GroupMLRunner(config).fit_evaluate(df)
     group_rows = result.leaderboard[result.leaderboard["mode"] == "group_split"]
@@ -406,6 +410,7 @@ def test_group_split_shared_cv_uses_outer_cv_not_training_score() -> None:
         feature_selectors=["none"],
         cv=4,
         test_size=0.2,
+        group_split_compare_shared_candidates=True,
     )
     result = GroupMLRunner(config).fit_evaluate(df)
     group_rows = result.leaderboard[result.leaderboard["mode"] == "group_split"]
@@ -417,7 +422,7 @@ def test_group_split_shared_cv_uses_outer_cv_not_training_score() -> None:
     assert cv_value > 0.2
 
 
-def test_group_tuning_progress_does_not_report_train_as_cv_when_cv_tuning_disabled() -> None:
+def test_group_tuning_progress_reports_score_source_and_finite_scores() -> None:
     rng = np.random.default_rng(113)
     n = 180
     df = pd.DataFrame(
@@ -451,8 +456,10 @@ def test_group_tuning_progress_does_not_report_train_as_cv_when_cv_tuning_disabl
 
     assert scored_events
     assert finished_events
-    assert all(np.isnan(float(item.get("cv_mean", np.nan))) for item in scored_events)
-    assert all(np.isnan(float(item.get("best_score", np.nan))) for item in finished_events)
+    assert all(str(item.get("score_source", "")) in {"cv", "train"} for item in scored_events)
+    assert all(str(item.get("score_source", "")) in {"cv", "train"} for item in finished_events)
+    assert any(np.isfinite(float(item.get("cv_mean", np.nan))) for item in scored_events)
+    assert any(np.isfinite(float(item.get("best_score", np.nan))) for item in finished_events)
 
 
 def test_all_runs_includes_group_level_rows_for_group_split() -> None:
@@ -485,3 +492,61 @@ def test_all_runs_includes_group_level_rows_for_group_split() -> None:
     assert set(group_rows["run_status"].astype(str)) == {"group_info"}
     assert {"cv_mean", "test_score", "train_rows", "test_rows"}.issubset(set(group_rows.columns))
     assert pd.to_numeric(group_rows["test_score"], errors="coerce").notna().any()
+
+
+def test_default_mode_counts_avoid_extra_group_split_shared_runs_and_summary_uses_result_rows() -> None:
+    rng = np.random.default_rng(171)
+    n = 220
+    df = pd.DataFrame(
+        {
+            "x": rng.normal(0, 1, n),
+            "ActionGroup": np.where(np.arange(n) % 2 == 0, "A", "B"),
+        }
+    )
+    df["Target"] = 2.0 * df["x"] + np.where(df["ActionGroup"] == "B", 1.0, -1.0)
+
+    events: list[dict[str, object]] = []
+
+    def _callback(event: dict[str, object]) -> None:
+        events.append(event)
+
+    config = GroupMLConfig(
+        target="Target",
+        feature_columns=["x", "ActionGroup"],
+        group_columns=["ActionGroup"],
+        experiment_modes=["full", "group_as_features", "group_split"],
+        models={
+            "linear": LinearRegression(),
+            "dummy_mean": DummyRegressor(strategy="mean"),
+            "dummy_median": DummyRegressor(strategy="median"),
+            "rf": RandomForestRegressor(n_estimators=40, random_state=42),
+        },
+        feature_selectors={"none": "none", "kbest_f": "kbest_f"},
+        cv=3,
+        test_size=0.2,
+    )
+    result = GroupMLRunner(config).fit_evaluate(df, callbacks=[_callback])
+
+    full_rows = result.leaderboard[result.leaderboard["mode"] == "full"]
+    onehot_rows = result.leaderboard[result.leaderboard["mode"] == "group_as_features"]
+    group_rows = result.leaderboard[result.leaderboard["mode"] == "group_split"]
+
+    assert len(full_rows) == 8
+    assert len(onehot_rows) == 8
+    assert len(group_rows[group_rows["model"] == "per_group_best"]) == 1
+    assert group_rows[group_rows["model"] != "per_group_best"].empty
+
+    run_started = [e for e in events if str(e.get("event")) == "run_started"]
+    assert run_started
+    assert int(run_started[0].get("total_experiments", -1) or -1) == 17
+    assert not any(str(e.get("event")) == "group_split_shared_candidate_evaluated" for e in events)
+
+    summary_tables = build_summary_tables(result, top_n=5)
+    valid_experiment_names = set(result.leaderboard["experiment_name"].astype(str).tolist())
+    for table_name in ["summary", "recommendations"]:
+        table = summary_tables[table_name]
+        if "experiment_name" not in table.columns:
+            continue
+        names = set(table["experiment_name"].astype(str))
+        names.discard("")
+        assert names.issubset(valid_experiment_names)

@@ -211,11 +211,27 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Library warning output level. "
             "'quiet' hides common sklearn/joblib noise, "
-            "'default' shows common warnings once, "
+            "'default' keeps standard warnings but hides known sklearn/joblib noise, "
             "'all' shows all warnings."
         ),
     )
     parser.add_argument("--min-group-size", type=int, default=15)
+    parser.add_argument(
+        "--compare-shared-group-split",
+        action="store_true",
+        help=(
+            "Also evaluate shared model+selector candidates in group_split/group_permutations. "
+            "Disabled by default to avoid retraining all shared candidates."
+        ),
+    )
+    parser.add_argument(
+        "--group-split-tune-with-cv",
+        action="store_true",
+        help=(
+            "Use nested CV inside per-group candidate tuning. "
+            "Disabled by default for speed; outer CV still evaluates final strategy."
+        ),
+    )
     parser.add_argument("--min-improvement", type=float, default=0.01)
     parser.add_argument("--scale-numeric", action="store_true", help="Scale numeric features.")
     parser.add_argument("--keep-nans", action="store_true", help="Disable base-row NaN dropping.")
@@ -299,6 +315,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         random_state=args.random_state,
         warning_verbosity=args.warning_verbosity,
         min_group_size=args.min_group_size,
+        group_split_compare_shared_candidates=args.compare_shared_group_split,
+        group_split_tune_candidates_with_cv=args.group_split_tune_with_cv,
         min_improvement=args.min_improvement,
         scale_numeric=args.scale_numeric,
         dropna_base_rows=not args.keep_nans,
@@ -579,15 +597,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             candidate = str(event.get("candidate", ""))
             model, selector = _split_candidate_label(candidate)
             score = _format_score(event.get("cv_mean"), positive_rmse=rmse_display)
+            score_source = str(event.get("score_source", "cv")).strip().lower()
+            prefix = "cv" if score_source == "cv" else "train"
             if rmse_display:
                 print(
                     f"[groupml]     {candidate_index}/{candidate_total}: "
-                    f"model={model} | selector={selector} | cv_rmse={score}"
+                    f"model={model} | selector={selector} | {prefix}_rmse={score}"
                 )
             else:
                 print(
                     f"[groupml]     {candidate_index}/{candidate_total}: "
-                    f"model={model} | selector={selector} | cv_score={score}"
+                    f"model={model} | selector={selector} | {prefix}_score={score}"
                 )
             return
         if event_name == "group_tuning_group_finished":
@@ -595,18 +615,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             best = str(event.get("best_candidate", ""))
             best_model, best_selector = _split_candidate_label(best)
             best_score = _format_score(event.get("best_score"), positive_rmse=rmse_display)
+            score_source = str(event.get("score_source", "cv")).strip().lower()
+            prefix = "cv" if score_source == "cv" else "train"
             used_fallback = bool(event.get("used_fallback", False))
             reason = str(event.get("reason", ""))
             suffix = f" | fallback ({reason})" if used_fallback else ""
             if rmse_display:
                 print(
                     f"[groupml]   best for {group_key}: model={best_model} | "
-                    f"selector={best_selector} | cv_rmse={best_score}{suffix}"
+                    f"selector={best_selector} | {prefix}_rmse={best_score}{suffix}"
                 )
             else:
                 print(
                     f"[groupml]   best for {group_key}: model={best_model} | "
-                    f"selector={best_selector} | cv_score={best_score}{suffix}"
+                    f"selector={best_selector} | {prefix}_score={best_score}{suffix}"
                 )
             return
         if event_name == "group_model_selected":
@@ -754,10 +776,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     assert result is not None
-    print(result.summary_text())
-    print()
-    print("Leaderboard:")
-    print(_leaderboard_for_display(result.leaderboard).head(args.top).to_string(index=False))
+    output_lines: list[str] = []
+    output_lines.append("[groupml] Finished.")
+    best = result.best_experiment or (
+        result.leaderboard.iloc[0].to_dict() if not result.leaderboard.empty else {}
+    )
+    if best:
+        best_method = str(best.get("method_type", MODE_LABELS.get(str(best.get("mode", "")), best.get("mode", ""))))
+        best_model = str(best.get("model", "unknown"))
+        best_selector = str(best.get("selector", "unknown"))
+        best_cv = _format_score(best.get("cv_mean"), positive_rmse=rmse_display)
+        best_test = _format_score(best.get("test_score"), positive_rmse=rmse_display)
+        if rmse_display:
+            output_lines.append(
+                f"[groupml] Best: {best_method} | model={best_model} | selector={best_selector} | cv_rmse={best_cv} | test_rmse={best_test}"
+            )
+        else:
+            output_lines.append(
+                f"[groupml] Best: {best_method} | model={best_model} | selector={best_selector} | cv_score={best_cv} | test_score={best_test}"
+            )
+    output_lines.append(f"[groupml] Recommendation: {result.recommendation}")
+
+    saved_outputs: list[tuple[str, Path]] = []
 
     out_path = Path(args.out) if args.out else Path.cwd() / default_summary_filename(
         ext=preferred_tabular_extension(args.report_format)
@@ -768,8 +808,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     used_bundle_export = output_suffix not in text_like_suffixes
     if not used_bundle_export:
         saved_path = export_summary(result, out_path, top_n=args.top)
-        print()
-        print(f"Saved summary: {saved_path}")
+        saved_outputs.append(("summary", saved_path))
     else:
         bundle_outputs = export_reporting_bundle(
             result=result,
@@ -778,26 +817,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             report_format=args.report_format,
             include_raw=not args.no_raw_report,
         )
-        print()
         if "workbook" in bundle_outputs:
-            print(f"Saved report workbook: {bundle_outputs['workbook']}")
-            print("Workbook sheets: summary, recommendations, all_runs, raw_results, warnings")
+            saved_outputs.append(("workbook", bundle_outputs["workbook"]))
         else:
             if "summary" in bundle_outputs:
-                print(f"Saved summary: {bundle_outputs['summary']}")
+                saved_outputs.append(("summary", bundle_outputs["summary"]))
             if "recommendations" in bundle_outputs:
-                print(f"Saved recommendations: {bundle_outputs['recommendations']}")
+                saved_outputs.append(("recommendations", bundle_outputs["recommendations"]))
             if "warnings" in bundle_outputs:
-                print(f"Saved warnings: {bundle_outputs['warnings']}")
+                saved_outputs.append(("warnings", bundle_outputs["warnings"]))
             if "all_runs" in bundle_outputs:
-                print(f"Saved all runs: {bundle_outputs['all_runs']}")
+                saved_outputs.append(("all_runs", bundle_outputs["all_runs"]))
             if "raw_results" in bundle_outputs:
-                print(f"Saved raw results: {bundle_outputs['raw_results']}")
+                saved_outputs.append(("raw_results", bundle_outputs["raw_results"]))
         saved_path = bundle_outputs.get("summary", out_path)
 
     if args.leaderboard_out:
         leaderboard_path = export_report(result, Path(args.leaderboard_out))
-        print(f"Saved leaderboard: {leaderboard_path}")
+        saved_outputs.append(("leaderboard", leaderboard_path))
     should_export_separate_raw = bool(args.raw_report_out) or not used_bundle_export
     if (
         should_export_separate_raw
@@ -811,6 +848,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             base = saved_path if saved_path.suffix else Path.cwd() / default_report_filename(ext=".csv")
             raw_report_path = base.with_name(f"{base.stem}_raw.csv")
         written_raw_path = export_raw_report(result, raw_report_path)
-        print(f"Saved raw report: {written_raw_path}")
+        saved_outputs.append(("raw_report", written_raw_path))
+
+    for line in output_lines:
+        print(line)
+    if saved_outputs:
+        print("[groupml] Reports:")
+        for label, path in saved_outputs:
+            print(f"[groupml]   {label}: {path}")
 
     return 130 if interrupted else 0

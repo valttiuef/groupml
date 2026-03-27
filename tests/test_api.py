@@ -141,6 +141,7 @@ def test_summary_includes_group_split_combined_comparison() -> None:
         models=[LinearRegression()],
         feature_selectors=["none"],
         cv=3,
+        group_split_compare_shared_candidates=True,
     )
     result = GroupMLRunner(config).fit_evaluate(df)
     summary_tables = build_summary_tables(result)

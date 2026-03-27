@@ -97,6 +97,7 @@ def test_cli_main_parses_arguments(monkeypatch) -> None:
     assert cfg.kbest_features == "auto"
     assert cfg.cv == 3
     assert cfg.warning_verbosity == "all"
+    assert cfg.group_split_compare_shared_candidates is False
     assert cfg.cv_fold_size_rows is None
     assert cfg.test_split_strategy == "last_rows"
     assert cfg.test_size == 0.15
@@ -163,6 +164,7 @@ def test_cli_main_parses_cv_fold_size_rows(monkeypatch) -> None:
     assert isinstance(cfg, GroupMLConfig)
     assert cfg.cv_fold_size_rows == 36
     assert cfg.warning_verbosity == "quiet"
+    assert cfg.group_split_compare_shared_candidates is False
 
 
 def test_cli_main_parses_kbest_features(monkeypatch) -> None:
@@ -763,11 +765,10 @@ def test_cli_progress_callback_prints_positive_rmse(monkeypatch, capsys) -> None
     stdout = capsys.readouterr().out
     assert "cv_rmse=1.23456" in stdout
     assert "test_rmse=2.34567" in stdout
-    leaderboard_section = stdout.split("Leaderboard:", maxsplit=1)[1]
-    assert "1.23456" in leaderboard_section
-    assert "2.34567" in leaderboard_section
-    assert "-1.23456" not in leaderboard_section
-    assert "-2.34567" not in leaderboard_section
+    assert "[groupml] Best:" in stdout
+    assert "cv_rmse=1.23456" in stdout
+    assert "test_rmse=2.34567" in stdout
+    assert "Leaderboard:" not in stdout
 
 
 def test_cli_main_exports_partial_outputs_on_keyboard_interrupt(monkeypatch, tmp_path: Path) -> None:

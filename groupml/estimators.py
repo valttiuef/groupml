@@ -125,7 +125,7 @@ class GroupSplitEstimator(BaseEstimator):
             score_map = self._score_candidates(X_subset, y_subset, candidates)
             candidate_total = len(score_map)
             for candidate_index, (candidate_name, score) in enumerate(score_map.items(), start=1):
-                if self.tune_candidates_with_cv and np.isfinite(score):
+                if np.isfinite(score):
                     self.candidate_group_scores_.setdefault(str(candidate_name), []).append(float(score))
                 self._emit_progress(
                     event="group_tuning_candidate_scored",
@@ -137,11 +137,8 @@ class GroupSplitEstimator(BaseEstimator):
                         "candidate_index": candidate_index,
                         "candidate_total": candidate_total,
                         "candidate": candidate_name,
-                        "cv_mean": (
-                            float(score)
-                            if self.tune_candidates_with_cv and np.isfinite(score)
-                            else np.nan
-                        ),
+                        "cv_mean": float(score) if np.isfinite(score) else np.nan,
+                        "score_source": "cv" if self.tune_candidates_with_cv else "train",
                     },
                 )
             candidate_name = self._best_candidate_from_scores(score_map, candidates)
@@ -172,17 +169,14 @@ class GroupSplitEstimator(BaseEstimator):
             self.selected_candidates_[key_tuple] = candidate_name
             self._emit_progress(
                 event="group_tuning_group_finished",
-                payload={
-                    "group_index": group_index,
-                    "group_total": total_groups,
-                    "group_key": group_key,
-                    "group_size": int(size),
-                    "best_candidate": candidate_name,
-                        "best_score": (
-                            best_score
-                            if self.tune_candidates_with_cv and np.isfinite(best_score)
-                            else np.nan
-                        ),
+                    payload={
+                        "group_index": group_index,
+                        "group_total": total_groups,
+                        "group_key": group_key,
+                        "group_size": int(size),
+                        "best_candidate": candidate_name,
+                        "best_score": best_score if np.isfinite(best_score) else np.nan,
+                        "score_source": "cv" if self.tune_candidates_with_cv else "train",
                         "used_fallback": False,
                         "reason": "",
                     },
